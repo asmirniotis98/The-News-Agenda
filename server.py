@@ -1,12 +1,14 @@
 """Η Ατζέντα των Ειδήσεων — API (FastAPI) και στατική σελίδα.
 
 Τοπικά:      python server.py               → http://127.0.0.1:8000
-Παραγωγή:    uvicorn server:app --host 0.0.0.0 --port 7860 --proxy-headers --forwarded-allow-ips="*"
+Παραγωγή:    βλ. Dockerfile (Hugging Face Spaces)
 Τεκμηρίωση API: /docs
 """
 
+import logging
 import os
 import re
+from urllib.parse import parse_qs, quote
 import threading
 import time
 from collections import defaultdict, deque
@@ -16,12 +18,19 @@ from typing import Annotated, Literal
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from src import peaks
+from src.env import load_env
+
+load_env()  # πρώτα το .env (τοπικά), ώστε τα παρακάτω modules να δουν τις ρυθμίσεις του
+
+from src import access, peaks  # noqa: E402
 from src.data_files import ensure_data
 from src.search import NewsIndex, make_query
+from src.summarize import BudgetExceeded, Summarizer, SummaryUnavailable
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -42,7 +51,14 @@ SOURCE = {
 
 # Όρια αιτημάτων: (πλήθος, παράθυρο σε δευτερόλεπτα). Ανά επισκέπτη (IP) και συνολικά για όλους, ώστε ακόμη κι αν
 # κάποιος παρακάμψει το όριο ανά IP, ο server να μην υπερφορτώνεται.
-RATE_LIMITS = {"search": (60, 60), "articles": (120, 60), "search_all": (600, 60), "articles_all": (1200, 60)}
+RATE_LIMITS = {
+    "search": (60, 60), "search_all": (600, 60),
+    "articles": (120, 60), "articles_all": (1200, 60),
+    "summary": (40, 600), "summary_all": (400, 600),   # οι συνόψεις κοστίζουν· βλ. και το ημερήσιο όριο
+    "login": (10, 900), "login_all": (100, 900),       # προσπάθειες εισόδου: προστασία από δοκιμές κωδικών
+}
+BUCKETS = {"/api/search": "search", "/api/articles": "articles", "/api/summary": "summary"}
+DOC_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 # Πόσοι αξιόπιστοι proxies βρίσκονται μπροστά από τον server (στο Hugging Face: TRUSTED_PROXY_HOPS στο Dockerfile).
 # Κάθε proxy προσθέτει μια IP στο ΤΕΛΟΣ του X-Forwarded-For. Οι πρώτες τιμές μπορεί να τις έχει γράψει ο ίδιος ο
@@ -69,6 +85,7 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), interest-cohort=()",
     "Cross-Origin-Opener-Policy": "same-origin",
     "Strict-Transport-Security": "max-age=31536000",  # οι browsers αγνοούν την οδηγία σε σύνδεση χωρίς HTTPS (τοπικά)
+    "X-Robots-Tag": "noindex, nofollow",  # η εφαρμογή δεν εμφανίζεται σε μηχανές αναζήτησης
 }
 
 
@@ -116,6 +133,7 @@ async def lifespan(_: FastAPI):
     idx = NewsIndex()
     state["idx"] = idx
     state["months"] = [pd.Timestamp(m).strftime("%Y-%m") for m in idx.months.month]
+    state["summarizer"] = Summarizer(idx)
     yield
     idx.con.close()
 
@@ -126,23 +144,47 @@ app = FastAPI(
                  "**Δεδομένα:** © ΑΠΕ-ΜΠΕ, μέσω [glossAPI/amna-press](https://huggingface.co/datasets/glossAPI/amna-press), "
                  "άδεια [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/) — μόνο μη εμπορική χρήση, "
                  "με αναφορά της πηγής. Κάθε απάντηση περιέχει το πεδίο `source`."),
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
+
+
+def is_https(request: Request) -> bool:
+    return request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https"
+
+
+def too_many(wait: int) -> JSONResponse:
+    return JSONResponse({"detail": "Πάρα πολλά αιτήματα. Δοκιμάστε ξανά σε λίγο."},
+                        status_code=429, headers={"Retry-After": str(wait), **SECURITY_HEADERS})
 
 
 @app.middleware("http")
 async def security(request: Request, call_next):
     path = request.url.path
-    bucket = "search" if path == "/api/search" else "articles" if path == "/api/articles" else None
+
+    # 1. Πρόσβαση με κωδικό
+    if access.misconfigured() and path != "/healthz":
+        return PlainTextResponse("Η εφαρμογή δεν έχει ρυθμιστεί (λείπει ο κωδικός πρόσβασης).",
+                                 status_code=503, headers=SECURITY_HEADERS)
+    if (access.enabled() and path not in access.PUBLIC_PATHS
+            and not access.token_valid(request.cookies.get(access.COOKIE))):
+        if path.startswith("/api/") or path in DOC_PATHS:
+            return JSONResponse({"detail": "Απαιτείται κωδικός πρόσβασης."}, status_code=401, headers=SECURITY_HEADERS)
+        target = path + (f"?{request.url.query}" if request.url.query else "")
+        return RedirectResponse(f"/login?next={quote(target, safe='')}", status_code=303, headers=SECURITY_HEADERS)
+
+    # 2. Όρια αιτημάτων (ανά επισκέπτη και συνολικά)
+    bucket = BUCKETS.get(path) or ("login" if path == "/login" and request.method == "POST" else None)
     if bucket:
         wait = limiter.check(client_ip(request), bucket) or limiter.check("*", bucket + "_all")
         if wait is not None:
-            return JSONResponse({"detail": "Πάρα πολλά αιτήματα. Δοκιμάστε ξανά σε λίγο."},
-                                status_code=429, headers={"Retry-After": str(wait), **SECURITY_HEADERS})
+            if bucket == "login":
+                return RedirectResponse("/login?error=wait", status_code=303, headers=SECURITY_HEADERS)
+            return too_many(wait)
+
     response = await call_next(request)
     response.headers.update(SECURITY_HEADERS)
-    if path.startswith("/api/"):
+    if path.startswith("/api/") or path.startswith("/login"):
         response.headers["Cache-Control"] = "no-store"
     elif path == "/" or path.startswith("/static/"):
         # Ο browser ελέγχει κάθε φορά αν υπάρχει νεότερη έκδοση (ETag), ώστε μετά από ενημέρωση να μη δείχνει παλιά σελίδα.
@@ -185,6 +227,8 @@ def meta():
         "examples": EXAMPLES,
         "methods": peaks.METHODS,
         "max_term": MAX_TERM,
+        "summaries": state["summarizer"].enabled,
+        "gated": access.enabled(),
         "source": SOURCE,
     }
 
@@ -252,6 +296,68 @@ def articles(
         ],
         "source": SOURCE,
     }
+
+
+@app.get("/api/summary", summary="Σύνοψη «τι συνέβη» σε έναν μήνα (LLM, από τους τίτλους των άρθρων)")
+def summary(
+    q: Term,
+    month: Annotated[str, Query(pattern=r"^\d{4}-\d{2}$", description="Μήνας ως ΕΕΕΕ-ΜΜ")],
+    all_forms: AllForms = True,
+    field: Field = "text",
+    cat: Categories = None,
+):
+    term, cats = clean_term(q), clean_categories(cat)
+    if month not in state["months"]:
+        raise HTTPException(422, "Άγνωστος μήνας.")
+    try:
+        result = state["summarizer"].summary(make_query(term, all_forms), month, field, cats)
+    except BudgetExceeded as e:
+        raise HTTPException(429, f"{e} Εμφανίζονται μόνο όσες έχουν ήδη δημιουργηθεί· δοκιμάστε ξανά αύριο.") from e
+    except SummaryUnavailable as e:
+        raise HTTPException(503, str(e)) from e
+    return {
+        **result,
+        "notice": "Αυτόματη σύνοψη από γλωσσικό μοντέλο (LLM), μόνο με βάση τους τίτλους των άρθρων. "
+                  "Μπορεί να περιέχει ανακρίβειες — ελέγξτε τους τίτλους και τα πρωτότυπα άρθρα.",
+        "source": SOURCE,
+    }
+
+
+# ---------------------------------------------------------------- είσοδος με κωδικό
+
+@app.get("/login", include_in_schema=False)
+def login_page():
+    if not access.enabled():
+        return RedirectResponse("/", status_code=303)
+    return FileResponse(WEB / "login.html")
+
+
+@app.post("/login", include_in_schema=False)
+async def login(request: Request):
+    body = await request.body()
+    if len(body) > 2048:
+        raise HTTPException(413, "Πολύ μεγάλο αίτημα.")
+    form = parse_qs(body.decode("utf-8", "replace"))
+    code = (form.get("code") or [""])[0].strip()
+    target = access.safe_next((form.get("next") or ["/"])[0])
+    if not access.enabled() or not access.code_matches(code):
+        return RedirectResponse(f"/login?error=1&next={quote(target, safe='')}", status_code=303)
+    response = RedirectResponse(target, status_code=303)
+    response.set_cookie(access.COOKIE, access.new_token(), max_age=access.SESSION_SECONDS,
+                        httponly=True, samesite="lax", secure=is_https(request), path="/")
+    return response
+
+
+@app.get("/logout", include_in_schema=False)
+def logout():
+    response = RedirectResponse("/login" if access.enabled() else "/", status_code=303)
+    response.delete_cookie(access.COOKIE, path="/")
+    return response
+
+
+@app.get("/robots.txt", include_in_schema=False)
+def robots():
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
 @app.get("/healthz", include_in_schema=False)

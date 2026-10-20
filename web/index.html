@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Η Ατζέντα των Ειδήσεων</title>
+  <meta name="robots" content="noindex, nofollow">
   <meta name="description" content="Πώς κινήθηκε ένας όρος στην ειδησεογραφία του ΑΠΕ-ΜΠΕ (2011–2026) και τι συνέβη στις κορυφώσεις του.">
   <link rel="icon" href="/static/ntua-logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
@@ -29,6 +30,7 @@
       <span class="d-none d-md-inline nav-sub">ΑΠΕ-ΜΠΕ · 2011–2026</span>
       <a href="/docs" target="_blank" rel="noopener" title="Τεκμηρίωση API"><i class="bi bi-braces"></i><span class="d-none d-sm-inline"> API</span></a>
       <a href="https://github.com/asmirniotis98/The-News-Agenda" target="_blank" rel="noopener noreferrer" title="Κώδικας στο GitHub"><i class="bi bi-github"></i></a>
+      <a href="/logout" id="logout" class="d-none" title="Έξοδος"><i class="bi bi-box-arrow-right"></i><span class="d-none d-sm-inline"> Έξοδος</span></a>
     </div>
   </div>
 </nav>
@@ -171,7 +173,7 @@
         <h3 class="peak-title mb-0"><span class="badge rank-badge"></span> <span class="peak-month"></span></h3>
         <div class="text-end peak-stats"><strong class="peak-hits"></strong> άρθρα<br><strong class="peak-share"></strong> του μήνα</div>
       </div>
-      <div class="summary mt-2 text-muted small"><i class="bi bi-robot"></i> Σύνοψη «τι συνέβη» — προστίθεται στη Φάση 4 (LLM).</div>
+      <div class="summary mt-2"></div>
       <button class="btn btn-sm btn-outline-secondary mt-2 toggle-articles" type="button" aria-expanded="false">
         <i class="bi bi-chevron-right"></i> Τίτλοι άρθρων
       </button>

@@ -12,6 +12,8 @@ let meta = null;          // από /api/meta
 let lastResult = null;    // τελευταία απάντηση του /api/search
 let searchCtrl = null;    // AbortController της τρέχουσας αναζήτησης
 let debounceTimer = null;
+let summaryCtrl = null;   // AbortController για τις συνόψεις της τρέχουσας αναζήτησης
+let summaryObserver = null;
 
 // ---------------------------------------------------------------- βοηθητικά
 
@@ -182,6 +184,7 @@ async function init() {
     return;
   }
   buildControls();
+  if (meta.gated) $('logout').classList.remove('d-none');
   applyUrl();
   runSearch();
 }
@@ -273,6 +276,7 @@ function renderPeaks(r) {
   $('peaks-title').textContent = `Κορυφώσεις (${r.peaks.length})`;
   const list = $('peaks');
   list.replaceChildren();
+  resetSummaries();
   if (!r.peaks.length) {
     list.append(el('div', { class: 'alert alert-info', text: 'Δεν εντοπίστηκαν σαφείς κορυφές. Δοκιμάστε την άλλη μέθοδο ή ευρύτερο διάστημα ετών.' }));
     return;
@@ -287,6 +291,58 @@ function renderPeaks(r) {
     card.querySelector('.peak-share').textContent = `${p.share.toLocaleString('el-GR')}%`;
     setupArticles(card, p.month, p.hits);
     list.append(card);
+    setupSummary(card.querySelector('.summary'), p.month, true);
+  }
+}
+
+// ---------------------------------------------------------------- σύνοψη «τι συνέβη» (LLM)
+
+function resetSummaries() {
+  if (summaryCtrl) summaryCtrl.abort();
+  summaryCtrl = new AbortController();
+  if (summaryObserver) summaryObserver.disconnect();
+  // Η σύνοψη ζητείται μόνο όταν η κάρτα φανεί στην οθόνη — κάρτες που δεν βλέπει κανείς δεν κοστίζουν.
+  summaryObserver = 'IntersectionObserver' in window
+    ? new IntersectionObserver((entries) => entries.forEach((e) => {
+        if (e.isIntersecting) { summaryObserver.unobserve(e.target); loadSummary(e.target); }
+      }), { rootMargin: '150px' })
+    : null;
+}
+
+function setupSummary(box, month, auto) {
+  box.dataset.month = month;
+  if (!meta.summaries) {
+    box.append(el('div', { class: 'text-muted small', text: 'Οι αυτόματες συνόψεις δεν είναι διαθέσιμες σε αυτή την έκδοση.' }));
+    return;
+  }
+  if (auto && summaryObserver) { summaryObserver.observe(box); return; }
+  if (auto) { loadSummary(box); return; }
+  const btn = el('button', { type: 'button', class: 'btn btn-sm btn-outline-primary', text: 'Σύνοψη «τι συνέβη»' });
+  btn.prepend(el('i', { class: 'bi bi-stars me-1' }));
+  btn.addEventListener('click', () => { btn.remove(); loadSummary(box); });
+  box.append(btn);
+}
+
+async function loadSummary(box) {
+  const params = filtersToParams(lastResult.filters, ARTICLE_KEYS);
+  params.set('month', box.dataset.month);
+  box.replaceChildren(el('div', { class: 'text-muted small' },
+    el('span', { class: 'spinner-border spinner-border-sm me-1' }), 'Δημιουργία σύνοψης…'));
+  try {
+    const s = await getJSON('/api/summary', params, summaryCtrl ? summaryCtrl.signal : undefined);
+    if (!s.bullets.length) {
+      box.replaceChildren(el('div', { class: 'text-muted small', text: 'Δεν υπάρχουν αρκετοί τίτλοι για σύνοψη.' }));
+      return;
+    }
+    const list = el('ul');
+    s.bullets.forEach((b) => list.append(el('li', { text: b })));
+    box.replaceChildren(el('div', { class: 'summary-box' },
+      el('div', { class: 'summary-title' }, el('i', { class: 'bi bi-stars me-1' }), 'Τι συνέβη'),
+      list,
+      el('div', { class: 'summary-notice', text: `${s.notice} (${s.n_titles} τίτλοι · ${s.model})` })));
+  } catch (e) {
+    if (e.name === 'AbortError') return;
+    box.replaceChildren(el('div', { class: 'text-muted small' }, el('i', { class: 'bi bi-info-circle me-1' }), e.message));
   }
 }
 
@@ -366,8 +422,10 @@ function showMonthPanel(ym) {
         el('div', { class: 'text-end peak-stats' }, el('strong', { text: fmt.format(hits) }), ' άρθρα', el('br'),
           el('strong', { text: `${share.toLocaleString('el-GR')}%` }), ' του μήνα'),
         close)),
+    el('div', { class: 'summary mt-2' }),
     box));
   panel.replaceChildren(card);
+  if (hits > 0) setupSummary(card.querySelector('.summary'), ym, false);
   panel.classList.remove('d-none');
   panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
   if (hits > 0) loadArticles(box, ym, 0);

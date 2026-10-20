@@ -55,6 +55,13 @@ button.pill { line-height: 1.5; }
 .peak-stats strong { color: var(--text); }
 .month-card { border-left: 4px solid var(--primary-light); }
 
+/* Σύνοψη LLM */
+.summary ul { margin: 0 0 .25rem; padding-left: 1.1rem; }
+.summary li { margin-bottom: .2rem; }
+.summary-box { background: #f8fafc; border: 1px solid #e5e9f0; border-radius: 8px; padding: 8px 12px; }
+.summary-title { font-size: .8rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: .03em; }
+.summary-notice { font-size: .75rem; color: var(--muted); }
+
 .articles ul { list-style: none; padding-left: 0; margin-bottom: 0; }
 .articles li { padding: 5px 0; border-bottom: 1px solid #eef2f7; font-size: .9rem; }
 .articles li:last-child { border-bottom: 0; }
