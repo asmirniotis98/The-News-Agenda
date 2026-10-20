@@ -11,3 +11,6 @@ __pycache__/
 # Data (large / licensed — not redistributed in the repo)
 data/*
 !data/.gitkeep
+
+# Φύλλο αξιολόγησης: αποσπάσματα άρθρων + συνόψεις — μένει τοπικά (δημοσιεύεται μόνο το results.md)
+evaluation/*.xlsx
