@@ -41,8 +41,6 @@ python server.py
 
 Ανοίγει στο http://127.0.0.1:8000 (μόνο στον δικό σας υπολογιστή). Τεκμηρίωση του API: http://127.0.0.1:8000/docs
 
-Η αρχική εκδοχή με Streamlit (`streamlit run app.py`) διατηρείται προσωρινά για σύγκριση.
-
 ## Πώς λειτουργεί
 
 1. **Αναζήτηση όρου** ([src/search.py](src/search.py)): ο όρος και τα άρθρα κανονικοποιούνται (πεζά, χωρίς τόνους, ς→σ).
@@ -115,7 +113,6 @@ server.py                 API (FastAPI) + σελίδα
 web/                      σελίδα: index.html, app.js, app.css
 run.bat                   εκκίνηση στα Windows
 Dockerfile, space/        δημοσίευση σε Hugging Face Spaces
-app.py                    αρχική εφαρμογή Streamlit (προσωρινά, για σύγκριση)
 src/normalize.py          κανονικοποίηση ελληνικού κειμένου
 src/search.py             αναζήτηση όρου, χρονοσειρά ανά μήνα
 src/peaks.py              εντοπισμός κορυφών
