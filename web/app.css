@@ -58,6 +58,10 @@ button.pill { line-height: 1.5; }
 /* Διακόπτης LLM */
 .llm-toggle { background: #eef4ff; border: 1px solid #dbe6fb; border-radius: 8px; padding: 8px 10px; }
 .llm-toggle .form-check-label { color: var(--primary); }
+.robot-box { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; background: #f8fafc; }
+.robot-box .form-check-input { width: 1.4em; height: 1.4em; margin-top: .05em; margin-right: .5em; }
+/* Κρυφό πεδίο-«παγίδα»: ο άνθρωπος δεν το βλέπει, τα bots συνήθως το συμπληρώνουν. */
+.robot-trap { position: absolute; left: -10000px; width: 1px; height: 1px; opacity: 0; }
 
 /* Σύνοψη LLM */
 .summary ul { margin: 0 0 .25rem; padding-left: 1.1rem; }

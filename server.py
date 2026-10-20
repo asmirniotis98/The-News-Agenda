@@ -61,7 +61,7 @@ RATE_LIMITS = {
     "llm_toggle": (20, 600), "llm_toggle_all": (300, 600),
 }
 BUCKETS = {"/api/search": "search", "/api/articles": "articles", "/api/summary": "summary",
-           "/api/llm/enable": "llm_toggle"}
+           "/api/llm/enable": "llm_toggle", "/api/llm/challenge": "llm_toggle"}
 DOC_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 # Πόσοι αξιόπιστοι proxies βρίσκονται μπροστά από τον server (στο Hugging Face: TRUSTED_PROXY_HOPS στο Dockerfile).
@@ -236,7 +236,7 @@ def meta(request: Request):
         "llm": {
             "available": state["summarizer"].enabled and llm_gate.available(),
             "enabled": llm_gate.token_valid(request.cookies.get(llm_gate.COOKIE)),
-            "captcha_site_key": llm_gate.SITE_KEY if llm_gate.captcha_configured() else None,
+            **llm_gate.client_config(),
         },
         "gated": access.enabled(),
         "source": SOURCE,
@@ -336,7 +336,12 @@ def summary(
     }
 
 
-@app.post("/api/llm/enable", summary="Ενεργοποίηση συνόψεων (απαιτεί Turnstile token)")
+@app.get("/api/llm/challenge", summary="Πρόκληση μίας χρήσης για το κουτί «δεν είμαι ρομπότ»")
+def llm_challenge():
+    return {"challenge": llm_gate.new_challenge(), "min_seconds": llm_gate.MIN_HUMAN_SECONDS}
+
+
+@app.post("/api/llm/enable", summary="Ενεργοποίηση συνόψεων (απαιτεί επιβεβαίωση «δεν είμαι ρομπότ»)")
 async def llm_enable(request: Request):
     if not (state["summarizer"].enabled and llm_gate.available()):
         raise HTTPException(503, "Οι αυτόματες συνόψεις δεν είναι διαθέσιμες.")
@@ -344,11 +349,13 @@ async def llm_enable(request: Request):
     if len(body) > 4096:
         raise HTTPException(413, "Πολύ μεγάλο αίτημα.")
     try:
-        token = str(json.loads(body or b"{}").get("token") or "")
-    except (ValueError, AttributeError):
+        payload = json.loads(body or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError
+    except ValueError:
         raise HTTPException(422, "Μη έγκυρο αίτημα.") from None
     # Η επαλήθευση καλεί το Cloudflare (έως ~30 s): σε ξεχωριστό νήμα, ώστε να μην παγώνει τον server για τους άλλους.
-    if not await run_in_threadpool(llm_gate.verify, token, client_ip(request)):
+    if not await run_in_threadpool(llm_gate.verify, payload, client_ip(request)):
         raise HTTPException(403, "Η επιβεβαίωση «δεν είμαι ρομπότ» απέτυχε. Δοκιμάστε ξανά.")
     response = JSONResponse({"enabled": True})
     response.set_cookie(llm_gate.COOKIE, llm_gate.new_token(), max_age=llm_gate.SECONDS,

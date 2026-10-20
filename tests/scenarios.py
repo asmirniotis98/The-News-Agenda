@@ -112,6 +112,7 @@ elif scenario in ("llm_pass", "llm_fail", "llm_required_unconfigured"):
     # Cloudflare's published Turnstile test keys: secret 1x... always passes, 2x... always fails.
     os.environ["ANTHROPIC_API_KEY"] = "test-not-a-real-key"
     os.environ["SUMMARY_DB"] = os.path.join(tempfile.mkdtemp(), "s.sqlite")
+    os.environ["CAPTCHA_MODE"] = "turnstile"
     if scenario == "llm_required_unconfigured":
         os.environ["REQUIRE_CAPTCHA"] = "1"
     else:
@@ -149,3 +150,38 @@ elif scenario in ("llm_pass", "llm_fail", "llm_required_unconfigured"):
                 ok(c.get("/api/summary", params=q).status_code == 403, "after disabling -> 403 again (next enable needs captcha)")
                 c.cookies.set("na_llm", "9999999999.forged")
                 ok(c.get("/api/summary", params=q).status_code == 403, "forged LLM cookie rejected")
+
+elif scenario == "llm_checkbox":
+    # Our own "I'm not a robot" box (default mode), as on the Space.
+    import time as _t
+    os.environ["ANTHROPIC_API_KEY"] = "test-not-a-real-key"
+    os.environ["SUMMARY_DB"] = os.path.join(tempfile.mkdtemp(), "s.sqlite")
+    os.environ["REQUIRE_CAPTCHA"] = "1"
+    from fastapi.testclient import TestClient
+    import server
+    from src import llm_gate
+    with TestClient(server.app, base_url="https://testserver") as c:
+        server.state["summarizer"].client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(
+            create=lambda **kw: SimpleNamespace(stop_reason="end_turn", model=kw["model"],
+                                               usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                                               content=[SimpleNamespace(type="text", text=json.dumps({"bullets": ["Δοκιμή"]}))]))))
+        m = c.get("/api/meta").json()["llm"]
+        ok(m["available"] and m["captcha"] == "checkbox" and not m["enabled"], "checkbox mode available, off by default")
+        q = {"q": "μνημόνιο", "month": "2015-08"}
+        en = lambda body: c.post("/api/llm/enable", json=body).status_code  # noqa: E731
+        ch = c.get("/api/llm/challenge").json()["challenge"]
+        ok(en({"challenge": ch, "confirm": True, "website": ""}) == 403, "too fast (< 1.5 s) -> rejected")
+        ch = c.get("/api/llm/challenge").json()["challenge"]; _t.sleep(1.7)
+        ok(en({"challenge": ch, "confirm": False, "website": ""}) == 403, "box not ticked -> rejected")
+        ok(en({"challenge": ch, "confirm": True, "website": "http://spam"}) == 403, "honeypot filled -> rejected")
+        ok(en({"confirm": True}) == 403, "no challenge -> rejected")
+        ok(en({"challenge": ch[:-4] + "abcd", "confirm": True, "website": ""}) == 403, "tampered challenge -> rejected")
+        old = llm_gate.new_challenge(now=_t.time() - 400)
+        ok(en({"challenge": old, "confirm": True, "website": ""}) == 403, "expired challenge (> 5 min) -> rejected")
+        ok(c.post("/api/llm/enable", content=b"[1,2]", headers={"content-type": "application/json"}).status_code == 422, "non-object JSON -> 422")
+        ok(c.get("/api/summary", params=q).status_code == 403, "still no summaries")
+        ok(en({"challenge": ch, "confirm": True, "website": ""}) == 200 and "na_llm" in c.cookies, "ticked, human speed -> enabled")
+        ok(c.get("/api/summary", params=q).json()["bullets"] == ["Δοκιμή"], "summaries work")
+        c.post("/api/llm/disable"); c.cookies.clear()
+        ok(en({"challenge": ch, "confirm": True, "website": ""}) == 403, "same challenge reused -> rejected")
+        ok(c.get("/api/summary", params=q).status_code == 403, "after disabling -> 403 (new box needed)")

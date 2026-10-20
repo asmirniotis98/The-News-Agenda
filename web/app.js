@@ -393,7 +393,8 @@ function loadTurnstile() {
 }
 
 async function enableLlm() {
-  if (!meta.llm.captcha_site_key) { activateLlm(''); return; }  // τοπικά, χωρίς κλειδιά Turnstile
+  if (meta.llm.captcha === 'checkbox') { showCheckbox(); return; }
+  if (!meta.llm.captcha_site_key) { activateLlm({}); return; }  // τοπικά, χωρίς επιβεβαίωση
   $('captcha-error').classList.add('d-none');
   captchaModal.show();
   try {
@@ -407,18 +408,55 @@ async function enableLlm() {
     sitekey: meta.llm.captcha_site_key,
     language: 'el',
     theme: 'light',
-    callback: (token) => activateLlm(token),
+    callback: (token) => activateLlm({ token }),
     'error-callback': () => showCaptchaError('Η επιβεβαίωση απέτυχε. Δοκιμάστε ξανά.'),
     'expired-callback': () => showCaptchaError('Η επιβεβαίωση έληξε. Τικάρετε ξανά το κουτί.'),
   });
 }
 
-async function activateLlm(token) {
+// Δικό μας κουτί: πρόκληση μίας χρήσης από τον server, κουτί, κρυφό πεδίο-«παγίδα» για bots.
+async function showCheckbox(keepError = false) {
+  if (!keepError) $('captcha-error').classList.add('d-none');
+  const box = $('captcha-box');
+  box.replaceChildren(el('div', { class: 'text-muted small' },
+    el('span', { class: 'spinner-border spinner-border-sm me-1' }), 'Φόρτωση…'));
+  captchaModal.show();
+  let ch;
+  try {
+    ch = await getJSON('/api/llm/challenge', new URLSearchParams());
+  } catch (e) {
+    box.replaceChildren();
+    showCaptchaError(e.message);
+    return;
+  }
+  const started = Date.now();
+  const check = el('input', { class: 'form-check-input', type: 'checkbox', id: 'robot-check' });
+  const trap = el('input', { type: 'text', name: 'website', tabindex: '-1', autocomplete: 'off', 'aria-hidden': 'true',
+    class: 'robot-trap' });
+  const go = el('button', { type: 'button', class: 'btn btn-primary w-100 mt-3', text: 'Ενεργοποίηση' });
+  go.disabled = true;
+  check.addEventListener('change', () => { go.disabled = !check.checked; });
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    // Ο server δέχεται την επιβεβαίωση μόνο μετά από χρόνο ανθρώπου· αν ο χρήστης ήταν πολύ γρήγορος, περιμένουμε.
+    const wait = ch.min_seconds * 1000 + 200 - (Date.now() - started);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    await activateLlm({ challenge: ch.challenge, confirm: check.checked, website: trap.value });
+    if (!llmEnabled) showCheckbox(true);  // νέα πρόκληση για νέα προσπάθεια, με το μήνυμα λάθους ορατό
+  });
+  box.replaceChildren(el('div', { class: 'w-100' },
+    el('div', { class: 'robot-box' },
+      el('div', { class: 'form-check mb-0' }, check,
+        el('label', { class: 'form-check-label fw-semibold', for: 'robot-check', text: 'Δεν είμαι ρομπότ' }))),
+    trap, go));
+}
+
+async function activateLlm(payload) {
   try {
     const res = await fetch('/api/llm/enable', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       let detail = 'Η ενεργοποίηση απέτυχε.';
@@ -430,7 +468,7 @@ async function activateLlm(token) {
     if (captchaModal) captchaModal.hide();
     refreshSummaries();
   } catch (e) {
-    if (meta.llm.captcha_site_key) {
+    if (meta.llm.captcha) {
       showCaptchaError(e.message);
       if (window.turnstile && captchaWidget !== null) turnstile.reset(captchaWidget);
     } else {
