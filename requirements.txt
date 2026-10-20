@@ -1,0 +1,6 @@
+duckdb>=1.1
+pandas>=2.2
+pyarrow>=17
+huggingface_hub>=0.25
+matplotlib>=3.9
+jupyter>=1.1
