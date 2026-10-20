@@ -115,6 +115,9 @@ async def security(request: Request, call_next):
     response.headers.update(SECURITY_HEADERS)
     if path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
+    elif path == "/" or path.startswith("/static/"):
+        # Ο browser ελέγχει κάθε φορά αν υπάρχει νεότερη έκδοση (ETag), ώστε μετά από ενημέρωση να μη δείχνει παλιά σελίδα.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
