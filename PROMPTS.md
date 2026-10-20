@@ -97,3 +97,19 @@
 
 **Prompt 10**
 > yes, commit and go ahead.
+
+Αποτέλεσμα του Prompt 10:
+- `server.py` (FastAPI): `/api/meta`, `/api/search`, `/api/articles`, τεκμηρίωση στο `/docs`· έλεγχος εισόδων,
+  όριο αιτημάτων ανά IP, security headers (CSP κ.ά.)
+- `web/` — νέα σελίδα με την αισθητική του MyRAE Analytics (Bootstrap 5, Plotly.js με SRI): κλικ σε κορυφή → κάρτα,
+  κλικ σε οποιονδήποτε μήνα → τα άρθρα του, φίλτρα στη διεύθυνση (κοινοποιήσιμοι σύνδεσμοι), δεδομένα πάντα ως κείμενο
+- `run.bat` προσαρμοσμένο από το MyRAE Analytics (χωρίς MySQL)· `requirements.txt` (server) / `requirements-dev.txt`
+- `Dockerfile`, `space/README.md`, `scripts/deploy_space.py`, `src/data_files.py` για Hugging Face Spaces
+- Έλεγχοι: μη έγκυρες είσοδοι → 422, ανύπαρκτα endpoints (shutdown/admin/αρχεία) → 404, 61ο αίτημα/λεπτό → 429,
+  δοκιμή XSS με `<img onerror>` εμφανίζεται ως κείμενο
+
+Ευρήματα:
+- Το image ενός δημόσιου Docker Space μπορεί να το κατεβάσει οποιοσδήποτε → τα δεδομένα κατεβαίνουν κατά την εκκίνηση
+  από ιδιωτικό repo αντί να μπαίνουν στο image.
+- Το pip στα Windows διαβάζει το requirements.txt με κωδικοποίηση cp1252 → σχόλια μόνο με λατινικούς χαρακτήρες.
+- Οι κατηγορίες «Ελλάδα»/«Κόσμος» υπάρχουν μόνο από το 2017 → σημείωση στη σελίδα, υπολογισμένη από τα δεδομένα.

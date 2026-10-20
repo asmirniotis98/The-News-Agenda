@@ -94,6 +94,10 @@ class NewsIndex:
         """).df()
         self.categories = [r[0] for r in self.con.sql(
             "SELECT category FROM month_totals GROUP BY 1 ORDER BY sum(n) DESC").fetchall()]
+        # Οι κατηγορίες του ΑΠΕ-ΜΠΕ άλλαξαν με τα χρόνια (π.χ. «Ελλάδα», «Κόσμος» μόνο από το 2017).
+        self.category_since = {c: m for c, m in self.con.sql(f"""
+            SELECT category, min(month) FROM month_totals WHERE n >= {MIN_MONTH_ARTICLES // 5} GROUP BY 1
+        """).fetchall()}
 
     @staticmethod
     def _word_range(cur, word: str, prefix: bool) -> tuple[int, int] | None:

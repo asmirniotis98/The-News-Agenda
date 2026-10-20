@@ -5,15 +5,18 @@
 
 Project #14 — Σύγχρονες Διαδικτυακές Υπηρεσίες (2026-27). Πλάνο: [WORKPLAN.md](WORKPLAN.md) · Prompts: [PROMPTS.md](PROMPTS.md)
 
-> 🚧 Σε εξέλιξη — ολοκληρώθηκαν οι Φάσεις 0–3 (δεδομένα, αναζήτηση, γράφημα, κορυφές). Επόμενη: σύνοψη με LLM.
+> 🚧 Σε εξέλιξη — ολοκληρώθηκαν οι Φάσεις 0–3 (δεδομένα, αναζήτηση, γράφημα, κορυφές) και η μετάβαση σε FastAPI + δική μας σελίδα. Επόμενη: σύνοψη με LLM.
 
 ## Εγκατάσταση
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate          # Windows  (Linux/macOS: source .venv/bin/activate)
-pip install -r requirements.txt
+pip install -r requirements-dev.txt     # ή requirements.txt για μόνο τον server
 ```
+
+Στα Windows αρκεί διπλό κλικ στο **`run.bat`**: βρίσκει/εγκαθιστά Python, φτιάχνει το `.venv`, εγκαθιστά πακέτα
+(μόνο όταν αλλάζει το `requirements.txt`), προετοιμάζει τα δεδομένα αν λείπουν και ανοίγει την εφαρμογή.
 
 ## Δεδομένα
 
@@ -32,10 +35,12 @@ pip install -r requirements.txt
 ## Εκτέλεση
 
 ```bash
-streamlit run app.py
+python server.py
 ```
 
-Ανοίγει στο http://localhost:8501. Η πρώτη φόρτωση των άρθρων διαρκεί λίγα δευτερόλεπτα· κάθε αναζήτηση ~1–2 δευτερόλεπτα.
+Ανοίγει στο http://127.0.0.1:8000 (μόνο στον δικό σας υπολογιστή). Τεκμηρίωση του API: http://127.0.0.1:8000/docs
+
+Η αρχική εκδοχή με Streamlit (`streamlit run app.py`) διατηρείται προσωρινά για σύγκριση.
 
 ## Πώς λειτουργεί
 
@@ -47,16 +52,46 @@ streamlit run app.py
    του ΑΠΕ-ΜΠΕ αυξάνεται ~10 φορές από το 2011 στο 2018, οπότε το ποσοστό είναι η δίκαιη σύγκριση.
 3. **Κορυφές** ([src/peaks.py](src/peaks.py)): μέθοδος *prominence* (προεπιλογή) ή *z-score*· σύγκριση στο
    [notebooks/02_peaks.ipynb](notebooks/02_peaks.ipynb).
+4. **Εφαρμογή**: ο [server.py](server.py) (FastAPI) δίνει JSON (`/api/search`, `/api/articles`, `/api/meta`) και τη σελίδα
+   [web/](web/) (HTML/JS, Bootstrap, Plotly.js), που ζητά μόνο ό,τι αλλάζει. Κλικ σε μήνα του γραφήματος → τα άρθρα του.
+   Τα φίλτρα γράφονται στη διεύθυνση, ώστε κάθε αναζήτηση να μπορεί να μοιραστεί ως σύνδεσμος.
+
+> Σημείωση για τα δεδομένα: οι κατηγορίες του ΑΠΕ-ΜΠΕ άλλαξαν με τα χρόνια — «Ελλάδα» και «Κόσμος» υπάρχουν μόνο από το 2017,
+> «Πολιτική» από τα τέλη του 2013. Με φίλτρο κατηγορίας τα πρώτα έτη μπορεί να είναι κενά.
+
+## Ασφάλεια
+
+- Τοπικά ο server ακούει μόνο στο `127.0.0.1`· online τρέχει στο Hugging Face, όχι στο δικό σας δίκτυο.
+- Έλεγχος όλων των εισόδων (μήκος όρου, επιτρεπτές τιμές φίλτρων)· παραμετρικά ερωτήματα SQL· βάση μόνο για ανάγνωση.
+- Όριο αιτημάτων ανά επισκέπτη (60 αναζητήσεις/λεπτό)· οι IP κρατιούνται μόνο στη μνήμη.
+- Security headers (Content-Security-Policy, nosniff, referrer policy)· οι βιβλιοθήκες από CDN με έλεγχο ακεραιότητας (SRI).
+- Τίτλοι και κείμενα εμφανίζονται πάντα ως κείμενο, όχι ως HTML.
+- Τα δεδομένα δεν μπαίνουν στο Docker image (το image δημόσιου Space μπορεί να το κατεβάσει οποιοσδήποτε): κατεβαίνουν
+  κατά την εκκίνηση από ιδιωτικό dataset repo, με token μόνο ανάγνωσης που δίνεται ως secret.
+
+## Δημοσίευση (Hugging Face Spaces)
+
+1. `hf auth login` με token εγγραφής (μόνο στον υπολογιστή σας).
+2. `python scripts/deploy_space.py data --user <hf-user>` — ανεβάζει `news.duckdb`, `texts.parquet` σε **ιδιωτικό** dataset repo.
+3. `python scripts/deploy_space.py app --user <hf-user>` — ανεβάζει τον κώδικα σε Docker Space (ιδιωτικό· `--public` για δημόσιο).
+4. Στη σελίδα του Space → Settings → Variables and secrets: secret `HF_TOKEN` = fine-grained token **μόνο ανάγνωσης**
+   στο dataset repo.
 
 ## Δομή
 
 ```
-app.py                    εφαρμογή Streamlit
+server.py                 API (FastAPI) + σελίδα
+web/                      σελίδα: index.html, app.js, app.css
+run.bat                   εκκίνηση στα Windows
+Dockerfile, space/        δημοσίευση σε Hugging Face Spaces
+app.py                    αρχική εφαρμογή Streamlit (προσωρινά, για σύγκριση)
 src/normalize.py          κανονικοποίηση ελληνικού κειμένου
 src/search.py             αναζήτηση όρου, χρονοσειρά ανά μήνα
 src/peaks.py              εντοπισμός κορυφών
+src/data_files.py         αρχεία δεδομένων και λήψη τους στον server
 scripts/prepare_data.py   λήψη, προεπεξεργασία dataset, ευρετήριο λέξεων
 scripts/benchmark_search.py  μέτρηση ταχύτητας/ορθότητας αναζήτησης
+scripts/deploy_space.py   δημοσίευση δεδομένων και εφαρμογής στο Hugging Face
 notebooks/                εξερεύνηση δεδομένων
 evaluation/               αξιολόγηση σε δείγμα
 docs/                     αναφορά, παρουσίαση
