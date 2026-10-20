@@ -5,10 +5,13 @@ FROM python:3.12-slim
 # Τα Spaces τρέχουν το container ως χρήστη 1000· όχι root.
 RUN useradd -m -u 1000 user
 USER user
+# TRUSTED_PROXY_HOPS: ο proxy του Hugging Face προσθέτει την πραγματική IP του επισκέπτη ως ΤΕΛΕΥΤΑΙΑ τιμή
+# του X-Forwarded-For (ελέγχθηκε 20/10/2026) — βλ. client_ip() στο server.py.
 ENV HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    TRUSTED_PROXY_HOPS=1
 WORKDIR /home/user/app
 
 COPY --chown=user requirements.txt .
@@ -19,5 +22,6 @@ COPY --chown=user src ./src
 COPY --chown=user web ./web
 
 EXPOSE 7860
-# --proxy-headers: η πραγματική IP του επισκέπτη έρχεται από τον proxy του Hugging Face (για τα όρια αιτημάτων).
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Την IP του επισκέπτη τη διαβάζει ο server.py από το X-Forwarded-For (βλ. TRUSTED_PROXY_HOPS) — όχι το uvicorn,
+# που με --forwarded-allow-ips="*" θα εμπιστευόταν και τιμές γραμμένες από τον ίδιο τον επισκέπτη.
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860", "--no-proxy-headers"]

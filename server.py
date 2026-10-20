@@ -30,8 +30,14 @@ EXAMPLES = ["μνημόνιο", "πανδημία", "ακρίβεια", "μετ�
 MAX_TERM = 60
 ARTICLE_URL = re.compile(r"^https://(www\.)?amna\.gr/")
 
-# Όρια αιτημάτων ανά επισκέπτη (διεύθυνση IP): (πλήθος, παράθυρο σε δευτερόλεπτα).
-RATE_LIMITS = {"search": (60, 60), "articles": (120, 60)}
+# Όρια αιτημάτων: (πλήθος, παράθυρο σε δευτερόλεπτα). Ανά επισκέπτη (IP) και συνολικά για όλους, ώστε ακόμη κι αν
+# κάποιος παρακάμψει το όριο ανά IP, ο server να μην υπερφορτώνεται.
+RATE_LIMITS = {"search": (60, 60), "articles": (120, 60), "search_all": (600, 60), "articles_all": (1200, 60)}
+
+# Πόσοι αξιόπιστοι proxies βρίσκονται μπροστά από τον server (στο Hugging Face: TRUSTED_PROXY_HOPS στο Dockerfile).
+# Κάθε proxy προσθέτει μια IP στο ΤΕΛΟΣ του X-Forwarded-For. Οι πρώτες τιμές μπορεί να τις έχει γράψει ο ίδιος ο
+# επισκέπτης, άρα η πραγματική IP είναι η N-οστή από το τέλος — ποτέ η πρώτη. Τοπικά (0): η IP της σύνδεσης.
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
 
 # Επιτρέπεται μόνο το δικό μας origin, τα συγκεκριμένα CDN και η ενσωμάτωση στη σελίδα του Hugging Face.
 CSP = "; ".join([
@@ -52,7 +58,17 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), interest-cohort=()",
     "Cross-Origin-Opener-Policy": "same-origin",
+    "Strict-Transport-Security": "max-age=31536000",  # οι browsers αγνοούν την οδηγία σε σύνδεση χωρίς HTTPS (τοπικά)
 }
+
+
+def client_ip(request: Request) -> str:
+    peer = request.client.host if request.client else "?"
+    if not TRUSTED_PROXY_HOPS:
+        return peer
+    hops = [h.strip() for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+    # Λιγότερες τιμές απ' όσους proxies: το αίτημα δεν πέρασε από αυτούς — μετράμε τη σύνδεση.
+    return hops[-TRUSTED_PROXY_HOPS] if len(hops) >= TRUSTED_PROXY_HOPS else peer
 
 
 class RateLimiter:
@@ -107,7 +123,7 @@ async def security(request: Request, call_next):
     path = request.url.path
     bucket = "search" if path == "/api/search" else "articles" if path == "/api/articles" else None
     if bucket:
-        wait = limiter.check(request.client.host if request.client else "?", bucket)
+        wait = limiter.check(client_ip(request), bucket) or limiter.check("*", bucket + "_all")
         if wait is not None:
             return JSONResponse({"detail": "Πάρα πολλά αιτήματα. Δοκιμάστε ξανά σε λίγο."},
                                 status_code=429, headers={"Retry-After": str(wait), **SECURITY_HEADERS})
