@@ -21,6 +21,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from src.env import load_env
 
@@ -346,7 +347,8 @@ async def llm_enable(request: Request):
         token = str(json.loads(body or b"{}").get("token") or "")
     except (ValueError, AttributeError):
         raise HTTPException(422, "Μη έγκυρο αίτημα.") from None
-    if not llm_gate.verify(token, client_ip(request)):
+    # Η επαλήθευση καλεί το Cloudflare (έως ~30 s): σε ξεχωριστό νήμα, ώστε να μην παγώνει τον server για τους άλλους.
+    if not await run_in_threadpool(llm_gate.verify, token, client_ip(request)):
         raise HTTPException(403, "Η επιβεβαίωση «δεν είμαι ρομπότ» απέτυχε. Δοκιμάστε ξανά.")
     response = JSONResponse({"enabled": True})
     response.set_cookie(llm_gate.COOKIE, llm_gate.new_token(), max_age=llm_gate.SECONDS,

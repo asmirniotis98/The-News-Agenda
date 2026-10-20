@@ -12,15 +12,12 @@
 
 import hashlib
 import hmac
-import json
 import logging
 import os
 import secrets
-import ssl
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+
+import httpx2
 
 log = logging.getLogger("llm_gate")
 
@@ -32,14 +29,6 @@ COOKIE = "na_llm"
 SECONDS = 2 * 3600
 
 _KEY = secrets.token_bytes(32)
-
-# Πιστοποιητικά HTTPS από το certifi: το ελαφρύ Docker image δεν έχει πάντα τα πιστοποιητικά του συστήματος.
-try:
-    import certifi
-    _TLS = ssl.create_default_context(cafile=certifi.where())
-except ImportError:  # pragma: no cover
-    _TLS = ssl.create_default_context()
-
 
 def captcha_configured() -> bool:
     return bool(SITE_KEY and SECRET_KEY)
@@ -69,15 +58,21 @@ def verify(captcha_token: str, ip: str) -> bool:
         return not REQUIRED
     if not captcha_token or len(captcha_token) > 2048:
         return False
-    data = urllib.parse.urlencode({"secret": SECRET_KEY, "response": captcha_token, "remoteip": ip}).encode()
-    request = urllib.request.Request(VERIFY_URL, data=data, method="POST",
-                                     headers={"User-Agent": "news-agenda/1.0", "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=10, context=_TLS) as r:
-            result = json.loads(r.read())
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
-        # Η αιτία (π.χ. πιστοποιητικό, DNS, HTTP 4xx) — ποτέ το κλειδί ή το token.
-        log.warning("Turnstile: αποτυχία επαλήθευσης (%s: %s)", type(e).__name__, str(getattr(e, "reason", e))[:120])
+    # Μέσω httpx2 (η βιβλιοθήκη του Claude SDK, που λειτουργεί από το Space)· με urllib η σύνδεση HTTPS από το Space
+    # προς το Cloudflare «κολλούσε» στη χειραψία. Μία επανάληψη για προσωρινά σφάλματα δικτύου.
+    form = {"secret": SECRET_KEY, "response": captcha_token, "remoteip": ip}
+    result = None
+    for attempt in (1, 2):
+        try:
+            r = httpx2.post(VERIFY_URL, data=form, timeout=15.0,
+                            headers={"User-Agent": "news-agenda/1.0", "Accept": "application/json"})
+            r.raise_for_status()
+            result = r.json()
+            break
+        except (httpx2.HTTPError, ValueError) as e:
+            # Η αιτία (π.χ. timeout, HTTP 4xx) — ποτέ το κλειδί ή το token.
+            log.warning("Turnstile: αποτυχία επαλήθευσης, προσπάθεια %d (%s: %s)", attempt, type(e).__name__, str(e)[:120])
+    if result is None:
         return False
     if not result.get("success"):
         log.info("Turnstile: απόρριψη (%s)", ",".join(result.get("error-codes", [])) or "—")

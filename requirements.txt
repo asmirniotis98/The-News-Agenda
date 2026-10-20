@@ -7,4 +7,4 @@ fastapi==0.151.0
 uvicorn==0.54.0
 huggingface_hub==2.2.0
 anthropic==1.15.0
-certifi==2026.10.19
+httpx2==2.15.1
