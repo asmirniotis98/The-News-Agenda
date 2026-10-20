@@ -1,5 +1,7 @@
 # The-News-Agenda — Η Ατζέντα των Ειδήσεων
 
+*The News Agenda: track how terms trend in Greek news coverage (ΑΠΕ-ΜΠΕ, 2011–2026), detect peaks, and get LLM summaries of what happened at each peak.*
+
 Για έναν όρο (π.χ. «μνημόνιο», «πανδημία», «ακρίβεια») η εφαρμογή δείχνει την πορεία του στην ειδησεογραφία
 του ΑΠΕ-ΜΠΕ 2011–2026, τις κορυφώσεις και σύνοψη «τι συνέβη» σε κάθε κορύφωση (με LLM).
 
