@@ -16,6 +16,24 @@ def normalize(text: str) -> str:
     return unicodedata.normalize("NFC", stripped).replace("ς", "σ")
 
 
+# Λέξη = συνεχόμενα γράμματα (Unicode). Ίδιος ορισμός με τα όρια λέξης της αναζήτησης ([^\p{L}]).
+WORD_SQL = r"\p{L}+"
+
+
+def words(text: str) -> list[str]:
+    """Οι λέξεις ενός κανονικοποιημένου κειμένου, με τον ίδιο ορισμό όπως το WORD_SQL."""
+    out, cur = [], []
+    for ch in text:
+        if ch.isalpha():
+            cur.append(ch)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
 def normalize_sql(column: str) -> str:
     """Η ίδια κανονικοποίηση ως έκφραση DuckDB SQL για μια στήλη."""
     return f"replace(strip_accents(lower(coalesce({column}, ''))), 'ς', 'σ')"

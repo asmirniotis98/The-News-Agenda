@@ -53,3 +53,47 @@
 - Τα όρια των κορυφών χαλάρωσαν (5% / 8% του μεγίστου), αλλιώς για «Ουκρανία» χανόταν η κορυφή του 2014 (Κριμαία)
   δίπλα στη μεγάλη κορυφή του 2022.
 - Η αναζήτηση σε όλο το κείμενο (341.613 άρθρα) γίνεται στη μνήμη με DuckDB: ~1,5 δευτερόλεπτα, ~660 MB μνήμης.
+
+---
+
+## Ταχύτητα αναζήτησης — ευρετήριο λέξεων (20/10/2026)
+
+**Prompt 5**
+> Is streamlit essential, because it is too slow. Does my professor allow for a different option, like a custom-made dashboard?
+
+Αποτέλεσμα: οι τεχνολογίες της εκφώνησης είναι «ενδεικτικές». Μέτρηση έδειξε ότι η καθυστέρηση οφείλεται κυρίως
+στην αναζήτηση (~1,5 s σάρωση όλων των κειμένων), όχι μόνο στο Streamlit.
+
+**Prompt 6**
+> First, describe what the prepare_data.py would do. Then, once we measure its effectiveness, we may reconsider the idea of a custom dashboard.
+
+**Prompt 7**
+> yes, start step 1 and measure it.
+
+Αποτέλεσμα:
+- `scripts/prepare_data.py` φτιάχνει `data/news.duckdb`: λεξιλόγιο (551.907 λέξεις), ευρετήριο λέξη → άρθρα,
+  ευρετήριο διαδοχικών ζευγών λέξεων (για φράσεις), και `data/texts.parquet` για τις σπάνιες περιπτώσεις
+- `src/search.py`: νέο `NewsIndex` πάνω στο ευρετήριο· το παλιό κρατήθηκε ως `ScanIndex` για σύγκριση
+- `scripts/benchmark_search.py` → [`evaluation/search_benchmark.md`](evaluation/search_benchmark.md):
+  ~0,02 s αντί ~1,6 s ανά αναζήτηση, 108 MB αντί ~1,9 GB μνήμη, **ίδια αποτελέσματα σε κάθε μήνα** σε 12 περιπτώσεις
+
+Αποφάσεις από τις μετρήσεις:
+- Η πρώτη εκδοχή αποθήκευε τα κείμενα μέσα στο DuckDB ασυμπίεστα (2 GB) → τα κείμενα μεταφέρθηκαν σε συμπιεσμένο parquet
+  και οι φράσεις δύο λέξεων απαντώνται από ευρετήριο ζευγών, χωρίς κείμενο.
+- Ο έλεγχος στο κείμενο (φράσεις 3+ λέξεων, όροι με ψηφία όπως «Covid-19») με 20 νήματα έφτανε ~1 GB μνήμη →
+  περιορισμός σε 4 νήματα: ~350 MB, με κόστος ~1,5 s μόνο σε αυτές τις σπάνιες περιπτώσεις.
+
+## Μετάβαση από Streamlit σε δική μας εφαρμογή (20/10/2026)
+
+**Prompt 8**
+> What if we update with new articles on a monthly basis? [...] Let's run through the perks of moving out of streamlit and into HF Spaces with Docker. [...] pros and cons [...] including also for the implementation of phase 4.
+
+**Prompt 9**
+> My project is here: C:\AI Agent\Analytics Tool. What can you scrape? [...] check [...] if the new system will allow for users outside of my Local Network to access the app and data, whilst maintaining data and system security, by 2026 standards.
+
+Αποτέλεσμα: απόφαση για FastAPI + δικό μας frontend (με την αισθητική του Analytics Tool: Bootstrap 5, Plotly.js)
+σε Hugging Face Spaces (Docker). Μέτρα ασφαλείας: HTTPS, κλειδιά ως secrets, ιδιωτικό dataset, έλεγχος εισόδων,
+όριο αιτημάτων ανά επισκέπτη, ημερήσιο όριο κόστους LLM, security headers, εμφάνιση τίτλων/συνόψεων ως κείμενο.
+
+**Prompt 10**
+> yes, commit and go ahead.
