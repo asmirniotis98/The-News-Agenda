@@ -24,4 +24,5 @@ COPY --chown=user web ./web
 EXPOSE 7860
 # Την IP του επισκέπτη τη διαβάζει ο server.py από το X-Forwarded-For (βλ. TRUSTED_PROXY_HOPS) — όχι το uvicorn,
 # που με --forwarded-allow-ips="*" θα εμπιστευόταν και τιμές γραμμένες από τον ίδιο τον επισκέπτη.
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860", "--no-proxy-headers"]
+# --no-access-log: δεν καταγράφεται κανένα αίτημα (π.χ. οι όροι αναζήτησης των επισκεπτών) στα logs του Space.
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860", "--no-proxy-headers", "--no-access-log"]
