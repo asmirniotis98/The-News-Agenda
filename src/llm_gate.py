@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import secrets
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -31,6 +32,13 @@ COOKIE = "na_llm"
 SECONDS = 2 * 3600
 
 _KEY = secrets.token_bytes(32)
+
+# Πιστοποιητικά HTTPS από το certifi: το ελαφρύ Docker image δεν έχει πάντα τα πιστοποιητικά του συστήματος.
+try:
+    import certifi
+    _TLS = ssl.create_default_context(cafile=certifi.where())
+except ImportError:  # pragma: no cover
+    _TLS = ssl.create_default_context()
 
 
 def captcha_configured() -> bool:
@@ -62,11 +70,14 @@ def verify(captcha_token: str, ip: str) -> bool:
     if not captcha_token or len(captcha_token) > 2048:
         return False
     data = urllib.parse.urlencode({"secret": SECRET_KEY, "response": captcha_token, "remoteip": ip}).encode()
+    request = urllib.request.Request(VERIFY_URL, data=data, method="POST",
+                                     headers={"User-Agent": "news-agenda/1.0", "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(urllib.request.Request(VERIFY_URL, data=data, method="POST"), timeout=10) as r:
+        with urllib.request.urlopen(request, timeout=10, context=_TLS) as r:
             result = json.loads(r.read())
     except (urllib.error.URLError, TimeoutError, ValueError) as e:
-        log.warning("Turnstile: αποτυχία επαλήθευσης (%s)", type(e).__name__)
+        # Η αιτία (π.χ. πιστοποιητικό, DNS, HTTP 4xx) — ποτέ το κλειδί ή το token.
+        log.warning("Turnstile: αποτυχία επαλήθευσης (%s: %s)", type(e).__name__, str(getattr(e, "reason", e))[:120])
         return False
     if not result.get("success"):
         log.info("Turnstile: απόρριψη (%s)", ",".join(result.get("error-codes", [])) or "—")
