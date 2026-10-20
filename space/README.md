@@ -17,4 +17,6 @@ short_description: Η πορεία ενός όρου στην ειδησεογρ
 
 Κώδικας και τεκμηρίωση: https://github.com/asmirniotis98/The-News-Agenda
 
-Δεδομένα: [glossAPI/amna-press](https://huggingface.co/datasets/glossAPI/amna-press) (ΑΠΕ-ΜΠΕ, CC BY-NC-ND 4.0).
+**Δεδομένα:** ειδησεογραφία του ΑΠΕ-ΜΠΕ (© ΑΠΕ-ΜΠΕ) μέσω [glossAPI/amna-press](https://huggingface.co/datasets/glossAPI/amna-press),
+άδεια [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/). Η εφαρμογή εμφανίζει μόνο αυτούσιους τίτλους
+με σύνδεσμο στο amna.gr και στατιστικά· τα δεδομένα δεν διανέμονται. Μη εμπορική, εκπαιδευτική χρήση.

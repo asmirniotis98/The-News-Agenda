@@ -30,6 +30,16 @@ EXAMPLES = ["μνημόνιο", "πανδημία", "ακρίβεια", "μετ�
 MAX_TERM = 60
 ARTICLE_URL = re.compile(r"^https://(www\.)?amna\.gr/")
 
+# Άδεια δεδομένων CC BY-NC-ND 4.0: αναφορά δημιουργού, άδειας και πηγής σε κάθε απάντηση με δεδομένα.
+SOURCE = {
+    "creator": "Αθηναϊκό-Μακεδονικό Πρακτορείο Ειδήσεων (ΑΠΕ-ΜΠΕ)",
+    "copyright": "© ΑΠΕ-ΜΠΕ — όλα τα δικαιώματα του περιεχομένου ανήκουν στο ΑΠΕ-ΜΠΕ",
+    "dataset": "https://huggingface.co/datasets/glossAPI/amna-press",
+    "license": "CC BY-NC-ND 4.0",
+    "license_url": "https://creativecommons.org/licenses/by-nc-nd/4.0/",
+    "notes": "Τίτλοι αυτούσιοι με σύνδεσμο στο πρωτότυπο· αριθμοί/κορυφές = στατιστικά της εφαρμογής. Μόνο μη εμπορική χρήση.",
+}
+
 # Όρια αιτημάτων: (πλήθος, παράθυρο σε δευτερόλεπτα). Ανά επισκέπτη (IP) και συνολικά για όλους, ώστε ακόμη κι αν
 # κάποιος παρακάμψει το όριο ανά IP, ο server να μην υπερφορτώνεται.
 RATE_LIMITS = {"search": (60, 60), "articles": (120, 60), "search_all": (600, 60), "articles_all": (1200, 60)}
@@ -112,7 +122,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Η Ατζέντα των Ειδήσεων — API",
-    description="Πορεία ενός όρου στην ειδησεογραφία του ΑΠΕ-ΜΠΕ (2011–2026) και οι κορυφώσεις του.",
+    description=("Πορεία ενός όρου στην ειδησεογραφία του ΑΠΕ-ΜΠΕ (2011–2026) και οι κορυφώσεις του.\n\n"
+                 "**Δεδομένα:** © ΑΠΕ-ΜΠΕ, μέσω [glossAPI/amna-press](https://huggingface.co/datasets/glossAPI/amna-press), "
+                 "άδεια [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/) — μόνο μη εμπορική χρήση, "
+                 "με αναφορά της πηγής. Κάθε απάντηση περιέχει το πεδίο `source`."),
     version="0.4.0",
     lifespan=lifespan,
 )
@@ -172,6 +185,7 @@ def meta():
         "examples": EXAMPLES,
         "methods": peaks.METHODS,
         "max_term": MAX_TERM,
+        "source": SOURCE,
     }
 
 
@@ -210,6 +224,7 @@ def search(
              "total": int(r.total), "share": round(float(r.share), 2)}
             for r in pk.itertuples()
         ],
+        "source": SOURCE,
     }
 
 
@@ -235,6 +250,7 @@ def articles(
              "url": r.url if ARTICLE_URL.match(r.url or "") else None, "in_title": bool(r.in_title)}
             for r in page.itertuples()
         ],
+        "source": SOURCE,
     }
 
 
