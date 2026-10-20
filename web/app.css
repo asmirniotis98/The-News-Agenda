@@ -1,0 +1,92 @@
+/* Χρώματα και ύφος από το MyRAE Analytics. */
+:root {
+  --primary: #1e3a5f; --primary-light: #2563eb; --accent: #0ea5e9;
+  --success: #16a34a; --danger: #dc2626; --warning: #d97706;
+  --bg: #f0f4f8; --border: #d1d5db; --text: #1f2937; --muted: #6b7280;
+  --peak: #dc2626;
+}
+body { background: var(--bg); font-family: 'Segoe UI', Tahoma, Arial, sans-serif; color: var(--text); }
+
+.navbar { background: var(--primary) !important; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+.navbar-brand { font-size: 1.2rem; font-weight: 700; color: #fff !important; }
+.navbar-brand .brand-text span { color: var(--accent); }
+.brand-logo { height: 34px; width: 34px; background: #fff; border-radius: 50%; padding: 2px; }
+.nav-links a { color: #cbd5e1; text-decoration: none; }
+.nav-links a:hover { color: #fff; }
+.nav-sub { color: #cbd5e1; font-size: .85rem; }
+
+.card { border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+.panel { position: sticky; top: 12px; }
+.btn-primary { background: var(--primary-light); border-color: var(--primary-light); }
+.btn-outline-primary { color: var(--primary-light); border-color: var(--primary-light); }
+.btn-check:checked + .btn-outline-primary { background: var(--primary-light); border-color: var(--primary-light); }
+
+.lead-text { color: var(--muted); }
+
+/* «Pills» για παραδείγματα και κατηγορίες (όπως τα φίλτρα έτους του MyRAE Analytics) */
+.pill { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; font-size: .82rem; font-weight: 600;
+        color: var(--primary); padding: 3px 11px; border: 1px solid var(--border); border-radius: 999px;
+        background: #fff; margin: 0 4px 4px 0; user-select: none; }
+.pill:hover { border-color: var(--primary-light); }
+.pill input { display: none; }
+.pill:has(input:checked) { background: #dbeafe; border-color: var(--primary-light); color: var(--primary-light); }
+button.pill { line-height: 1.5; }
+
+/* KPI */
+.kpi { padding: 14px 16px; height: 100%; }
+.kpi-label { font-size: .8rem; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+.kpi-value { font-size: 1.45rem; font-weight: 700; color: var(--primary); line-height: 1.25; overflow-wrap: anywhere; }
+.kpi-sub { font-size: .8rem; color: var(--muted); }
+.kpi-mono { font-family: Consolas, 'Courier New', monospace; font-size: 1.2rem; }
+
+/* Γράφημα */
+.chart { height: 420px; }
+.chart-loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                 background: rgba(255,255,255,.6); border-radius: 10px; }
+
+/* Κάρτες κορυφών */
+.section-title { font-size: 1.25rem; font-weight: 700; color: var(--primary); margin: 8px 0 12px; }
+.peak-card { border-left: 4px solid var(--peak); scroll-margin-top: 12px; }
+.peak-card.flash { animation: flash 1.2s ease-out; }
+@keyframes flash { from { box-shadow: 0 0 0 4px rgba(37,99,235,.45); } to { box-shadow: 0 1px 3px rgba(0,0,0,.06); } }
+.peak-title { font-size: 1.2rem; font-weight: 700; color: var(--primary); }
+.rank-badge { background: var(--peak); font-size: .85rem; vertical-align: middle; }
+.peak-stats { font-size: .85rem; color: var(--muted); white-space: nowrap; }
+.peak-stats strong { color: var(--text); }
+.month-card { border-left: 4px solid var(--primary-light); }
+
+/* Διακόπτης LLM */
+.llm-toggle { background: #eef4ff; border: 1px solid #dbe6fb; border-radius: 8px; padding: 8px 10px; }
+.llm-toggle .form-check-label { color: var(--primary); }
+
+/* Σύνοψη LLM */
+.summary ul { margin: 0 0 .25rem; padding-left: 1.1rem; }
+.summary li { margin-bottom: .2rem; }
+.summary-box { background: #f8fafc; border: 1px solid #e5e9f0; border-radius: 8px; padding: 8px 12px; }
+.summary-title { font-size: .8rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: .03em; }
+.summary-notice { font-size: .75rem; color: var(--muted); }
+
+.articles ul { list-style: none; padding-left: 0; margin-bottom: 0; }
+.articles li { padding: 5px 0; border-bottom: 1px solid #eef2f7; font-size: .9rem; }
+.articles li:last-child { border-bottom: 0; }
+.articles .a-date { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 6px; }
+.articles .a-cat { color: var(--muted); font-style: italic; font-size: .8rem; }
+.articles a { text-decoration: none; }
+.articles a:hover { text-decoration: underline; }
+.toggle-articles .bi { transition: transform .15s; display: inline-block; }
+.toggle-articles[aria-expanded="true"] .bi { transform: rotate(90deg); }
+
+@media (max-width: 991.98px) {
+  .panel { position: static; }
+  .chart { height: 340px; }
+}
+/* Κινητά: οι τρεις δείκτες σε μία γραμμή, ώστε το γράφημα να φαίνεται νωρίς. */
+@media (max-width: 767.98px) {
+  .lead-text { font-size: .85rem; margin-bottom: .5rem !important; }
+  .kpi { padding: 8px 10px; }
+  .kpi-label { font-size: .62rem; letter-spacing: 0; }
+  .kpi-value { font-size: 1rem; }
+  .kpi-mono { font-size: .9rem; }
+  .kpi-sub { font-size: .68rem; }
+  .chart { height: 300px; }
+}
