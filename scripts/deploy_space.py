@@ -15,6 +15,7 @@ import argparse
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from huggingface_hub import HfApi
@@ -26,6 +27,7 @@ from src.data_files import DATA, FILES  # noqa: E402
 # Μόνο αυτά πάνε στο Space — ποτέ data/, .env, notebooks κ.λπ.
 APP_FILES = ["Dockerfile", "requirements.txt", "server.py"]
 APP_DIRS = ["src", "web"]
+RETRIES = 10
 
 
 def deploy_data(api: HfApi, repo: str) -> None:
@@ -36,9 +38,25 @@ def deploy_data(api: HfApi, repo: str) -> None:
         path = DATA / name
         if not path.exists():
             sys.exit(f"Λείπει το {path}. Τρέξτε πρώτα `python scripts/prepare_data.py`.")
-        print(f"Ανέβασμα {name} ({path.stat().st_size / 1e6:,.0f} MB) → {repo}…")
-        api.upload_file(path_or_fileobj=str(path), path_in_repo=name, repo_id=repo, repo_type="dataset",
-                        commit_message=f"Update {name}")
+        if any(f.rfilename == name and f.size == path.stat().st_size
+               for f in api.repo_info(repo, repo_type="dataset", files_metadata=True).siblings):
+            print(f"{name}: υπάρχει ήδη, ίδιο μέγεθος — παραλείπεται.")
+            continue
+        # Σε αργές συνδέσεις η μεταφορά μπορεί να διακοπεί. Κάθε νέα προσπάθεια στέλνει μόνο ό,τι λείπει
+        # (το Hugging Face κρατά τα κομμάτια που έχουν ήδη φτάσει).
+        for attempt in range(1, RETRIES + 1):
+            print(f"Ανέβασμα {name} ({path.stat().st_size / 1e6:,.0f} MB) → {repo} (προσπάθεια {attempt}/{RETRIES})…",
+                  flush=True)
+            try:
+                api.upload_file(path_or_fileobj=str(path), path_in_repo=name, repo_id=repo, repo_type="dataset",
+                                commit_message=f"Update {name}")
+                break
+            except Exception as e:  # σφάλματα δικτύου έχουν διάφορους τύπους ανάλογα με το επίπεδο
+                if attempt == RETRIES:
+                    raise
+                print(f"  διακοπή: {type(e).__name__}: {str(e)[:150]} — νέα προσπάθεια σε 30 s", flush=True)
+                time.sleep(30)
+        print(f"  ✓ {name}", flush=True)
     print(f"✓ Δεδομένα στο ιδιωτικό https://huggingface.co/datasets/{repo}")
 
 

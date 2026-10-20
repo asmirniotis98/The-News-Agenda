@@ -69,3 +69,13 @@ button.pill { line-height: 1.5; }
   .panel { position: static; }
   .chart { height: 340px; }
 }
+/* Κινητά: οι τρεις δείκτες σε μία γραμμή, ώστε το γράφημα να φαίνεται νωρίς. */
+@media (max-width: 767.98px) {
+  .lead-text { font-size: .85rem; margin-bottom: .5rem !important; }
+  .kpi { padding: 8px 10px; }
+  .kpi-label { font-size: .62rem; letter-spacing: 0; }
+  .kpi-value { font-size: 1rem; }
+  .kpi-mono { font-size: .9rem; }
+  .kpi-sub { font-size: .68rem; }
+  .chart { height: 300px; }
+}
