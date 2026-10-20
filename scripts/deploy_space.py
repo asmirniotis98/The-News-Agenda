@@ -3,7 +3,8 @@
 Προϋπόθεση: `hf auth login` με token που έχει δικαίωμα εγγραφής (write) — μόνο στον δικό σας υπολογιστή.
 
     python scripts/deploy_space.py data  --user <hf-user>              # ανεβάζει news.duckdb, texts.parquet
-    python scripts/deploy_space.py app   --user <hf-user> [--public]   # ανεβάζει τον κώδικα στο Space
+    python scripts/deploy_space.py app   --user <hf-user>              # ανεβάζει τον κώδικα στο Space
+    python scripts/deploy_space.py app   --user <hf-user> --public     # ... και το κάνει δημόσιο (--private: το αντίθετο)
 
 Το Space χρειάζεται επιπλέον το secret HF_TOKEN: ένα *ξεχωριστό* fine-grained token μόνο με δικαίωμα
 ανάγνωσης στο dataset repo. Ορίζεται από τη σελίδα του Space (Settings → Variables and secrets),
@@ -41,8 +42,11 @@ def deploy_data(api: HfApi, repo: str) -> None:
     print(f"✓ Δεδομένα στο ιδιωτικό https://huggingface.co/datasets/{repo}")
 
 
-def deploy_app(api: HfApi, space: str, data_repo: str, public: bool) -> None:
+def deploy_app(api: HfApi, space: str, data_repo: str, public: bool | None) -> None:
+    # Νέο Space: ιδιωτικό, εκτός αν ζητηθεί --public. Υπάρχον Space: η ορατότητα αλλάζει μόνο με --public/--private.
     api.create_repo(space, repo_type="space", space_sdk="docker", private=not public, exist_ok=True)
+    if public is not None:
+        api.update_repo_settings(space, repo_type="space", private=not public)
     with tempfile.TemporaryDirectory() as tmp:
         stage = Path(tmp)
         for f in APP_FILES:
@@ -54,7 +58,8 @@ def deploy_app(api: HfApi, space: str, data_repo: str, public: bool) -> None:
                           delete_patterns=["src/**", "web/**"])
     api.add_space_variable(space, "DATA_REPO", data_repo)
 
-    print(f"✓ Κώδικας στο https://huggingface.co/spaces/{space} ({'δημόσιο' if public else 'ιδιωτικό'})")
+    private = api.repo_info(space, repo_type="space").private
+    print(f"✓ Κώδικας στο https://huggingface.co/spaces/{space} ({'ιδιωτικό' if private else 'ΔΗΜΟΣΙΟ'})")
     print("\nΑν δεν το έχετε κάνει ήδη: στη σελίδα του Space, Settings → Variables and secrets → New secret\n"
           f"  HF_TOKEN = ένα fine-grained token με ΜΟΝΟ «Read» στο dataset {data_repo}.")
 
@@ -65,7 +70,9 @@ def main() -> None:
     p.add_argument("--user", required=True, help="όνομα χρήστη στο Hugging Face")
     p.add_argument("--space", default="news-agenda")
     p.add_argument("--data-repo", default="news-agenda-data")
-    p.add_argument("--public", action="store_true", help="δημόσιο Space (προεπιλογή: ιδιωτικό, για δοκιμές)")
+    vis = p.add_mutually_exclusive_group()
+    vis.add_argument("--public", dest="public", action="store_true", default=None, help="κάνει το Space δημόσιο")
+    vis.add_argument("--private", dest="public", action="store_false", help="κάνει το Space ιδιωτικό")
     a = p.parse_args()
 
     api = HfApi()
