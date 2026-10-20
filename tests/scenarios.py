@@ -37,7 +37,8 @@ if scenario == "gate":
         ok(c.get("/api/search", params={"q": "abc"}).status_code == 200, "with cookie -> API works")
         ok(c.get("/").status_code == 200 and c.get("/docs").status_code == 200, "with cookie -> page and docs work")
         m = c.get("/api/meta").json(); ok(m["gated"] is True and m["summaries"] is False, "meta: gated, summaries off (no key)")
-        r = c.get("/api/summary", params={"q": "μνημόνιο", "month": "2015-08"}); ok(r.status_code == 503, f"summary without API key -> 503 ({r.json()['detail']})")
+        r = c.get("/api/summary", params={"q": "μνημόνιο", "month": "2015-08"}); ok(r.status_code == 403, f"summary with LLM switch off -> 403 ({r.json()['detail']})")
+        ok(c.post("/api/llm/enable", json={}).status_code == 503, "no API key -> switch cannot be enabled (503)")
         c.cookies.set("na_session", "9999999999.deadbeef"); ok(c.get("/api/search", params={"q": "abc"}).status_code == 401, "forged cookie rejected")
         c.cookies.clear()
         codes = [c.post("/login", content="code=nope", headers={"content-type": "application/x-www-form-urlencoded"}).headers["location"] for _ in range(12)]
@@ -106,3 +107,45 @@ elif scenario == "summarizer":
         s2.summary(q, "2013-03", "text", []); ok(False, "refusal")
     except S.SummaryUnavailable as e:
         ok(True, f"refusal -> friendly error ({e})")
+
+elif scenario in ("llm_pass", "llm_fail", "llm_required_unconfigured"):
+    # Cloudflare's published Turnstile test keys: secret 1x... always passes, 2x... always fails.
+    os.environ["ANTHROPIC_API_KEY"] = "test-not-a-real-key"
+    os.environ["SUMMARY_DB"] = os.path.join(tempfile.mkdtemp(), "s.sqlite")
+    if scenario == "llm_required_unconfigured":
+        os.environ["REQUIRE_CAPTCHA"] = "1"
+    else:
+        os.environ["TURNSTILE_SITE_KEY"] = "1x00000000000000000000AA"
+        os.environ["TURNSTILE_SECRET_KEY"] = ("1x0000000000000000000000000000000AA" if scenario == "llm_pass"
+                                              else "2x0000000000000000000000000000000AA")
+    from fastapi.testclient import TestClient
+    import server
+    with TestClient(server.app, base_url="https://testserver") as c:
+        fake = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: SimpleNamespace(
+            stop_reason="end_turn", model=kw["model"], usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            content=[SimpleNamespace(type="text", text=json.dumps({"bullets": ["Δοκιμή"]}))]))))
+        server.state["summarizer"].client = fake  # never call the real API in tests
+        m = c.get("/api/meta").json()["llm"]
+        q = {"q": "μνημόνιο", "month": "2015-08"}
+        if scenario == "llm_required_unconfigured":
+            ok(m["available"] is False, "captcha required but not configured -> switch unavailable")
+            ok(c.post("/api/llm/enable", json={"token": "x"}).status_code == 503, "enable refused (fail closed)")
+            ok(c.get("/api/summary", params=q).status_code == 403, "summary refused")
+        else:
+            ok(m["available"] and not m["enabled"] and bool(m["captcha_site_key"]), "switch available, off by default, site key sent")
+            ok(c.get("/api/summary", params=q).status_code == 403, "summary before enabling -> 403")
+            ok(c.post("/api/llm/enable", json={}).status_code == 403, "enable without captcha token -> 403")
+            r = c.post("/api/llm/enable", json={"token": "XXXX.DUMMY.TOKEN.XXXX"})
+            if scenario == "llm_fail":
+                ok(r.status_code == 403 and "na_llm" not in c.cookies, "Cloudflare says fail -> not enabled")
+            else:
+                ok(r.status_code == 200 and "na_llm" in c.cookies, "Cloudflare says pass -> enabled (cookie set)")
+                sc = r.headers.get("set-cookie", "")
+                ok("HttpOnly" in sc and "Secure" in sc, "LLM cookie HttpOnly + Secure")
+                ok(c.get("/api/meta").json()["llm"]["enabled"], "meta reports enabled")
+                r = c.get("/api/summary", params=q)
+                ok(r.status_code == 200 and r.json()["bullets"] == ["Δοκιμή"], "summary works after enabling")
+                c.post("/api/llm/disable")
+                ok(c.get("/api/summary", params=q).status_code == 403, "after disabling -> 403 again (next enable needs captcha)")
+                c.cookies.set("na_llm", "9999999999.forged")
+                ok(c.get("/api/summary", params=q).status_code == 403, "forged LLM cookie rejected")

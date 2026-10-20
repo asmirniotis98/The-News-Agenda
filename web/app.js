@@ -14,6 +14,10 @@ let searchCtrl = null;    // AbortController της τρέχουσας αναζ�
 let debounceTimer = null;
 let summaryCtrl = null;   // AbortController για τις συνόψεις της τρέχουσας αναζήτησης
 let summaryObserver = null;
+let llmEnabled = false;   // ο επισκέπτης άνοιξε τον διακόπτη (και ο server το επιβεβαίωσε)
+let captchaModal = null;
+let captchaWidget = null;
+let turnstileLoading = null;
 
 // ---------------------------------------------------------------- βοηθητικά
 
@@ -184,6 +188,7 @@ async function init() {
     return;
   }
   buildControls();
+  setupLlmToggle();
   if (meta.gated) $('logout').classList.remove('d-none');
   applyUrl();
   runSearch();
@@ -311,8 +316,13 @@ function resetSummaries() {
 
 function setupSummary(box, month, auto) {
   box.dataset.month = month;
-  if (!meta.summaries) {
+  if (!meta.llm.available) {
     box.append(el('div', { class: 'text-muted small', text: 'Οι αυτόματες συνόψεις δεν είναι διαθέσιμες σε αυτή την έκδοση.' }));
+    return;
+  }
+  if (!llmEnabled) {
+    box.append(el('div', { class: 'text-muted small' }, el('i', { class: 'bi bi-stars me-1' }),
+      'Ενεργοποιήστε τις «Αυτόματες συνόψεις (LLM)» για να δείτε τι συνέβη.'));
     return;
   }
   if (auto && summaryObserver) { summaryObserver.observe(box); return; }
@@ -342,8 +352,118 @@ async function loadSummary(box) {
       el('div', { class: 'summary-notice', text: `${s.notice} (${s.n_titles} τίτλοι · ${s.model})` })));
   } catch (e) {
     if (e.name === 'AbortError') return;
+    if (e.status === 403) { llmEnabled = false; $('llm-switch').checked = false; }  // π.χ. έληξε η ενεργοποίηση
     box.replaceChildren(el('div', { class: 'text-muted small' }, el('i', { class: 'bi bi-info-circle me-1' }), e.message));
   }
+}
+
+// ---------------------------------------------------------------- διακόπτης LLM + «δεν είμαι ρομπότ»
+
+function setupLlmToggle() {
+  const sw = $('llm-switch');
+  if (!meta.llm.available) {
+    sw.disabled = true;
+    $('llm-note').textContent = 'Δεν είναι διαθέσιμες σε αυτή την έκδοση.';
+    return;
+  }
+  llmEnabled = meta.llm.enabled;
+  sw.checked = llmEnabled;
+  sw.addEventListener('change', () => (sw.checked ? enableLlm() : disableLlm()));
+  captchaModal = new bootstrap.Modal($('captcha-modal'));
+  // Κλείσιμο του παραθύρου χωρίς επιβεβαίωση → ο διακόπτης γυρίζει πίσω.
+  $('captcha-modal').addEventListener('hidden.bs.modal', () => {
+    removeCaptcha();
+    if (!llmEnabled) $('llm-switch').checked = false;
+  });
+}
+
+function loadTurnstile() {
+  if (window.turnstile) return Promise.resolve();
+  if (!turnstileLoading) {
+    turnstileLoading = new Promise((resolve, reject) => {
+      // Το Cloudflare ζητά να μη «παγώνει» το script (αλλάζει συχνά), γι' αυτό χωρίς SRI· το CSP επιτρέπει μόνο αυτό το origin.
+      const s = el('script', { src: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit' });
+      s.async = true;
+      s.onload = resolve;
+      s.onerror = () => { turnstileLoading = null; reject(new Error('Δεν φορτώθηκε η επιβεβαίωση. Ελέγξτε τη σύνδεση.')); };
+      document.head.append(s);
+    });
+  }
+  return turnstileLoading;
+}
+
+async function enableLlm() {
+  if (!meta.llm.captcha_site_key) { activateLlm(''); return; }  // τοπικά, χωρίς κλειδιά Turnstile
+  $('captcha-error').classList.add('d-none');
+  captchaModal.show();
+  try {
+    await loadTurnstile();
+  } catch (e) {
+    showCaptchaError(e.message);
+    return;
+  }
+  removeCaptcha();
+  captchaWidget = turnstile.render('#captcha-box', {
+    sitekey: meta.llm.captcha_site_key,
+    language: 'el',
+    theme: 'light',
+    callback: (token) => activateLlm(token),
+    'error-callback': () => showCaptchaError('Η επιβεβαίωση απέτυχε. Δοκιμάστε ξανά.'),
+    'expired-callback': () => showCaptchaError('Η επιβεβαίωση έληξε. Τικάρετε ξανά το κουτί.'),
+  });
+}
+
+async function activateLlm(token) {
+  try {
+    const res = await fetch('/api/llm/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    if (!res.ok) {
+      let detail = 'Η ενεργοποίηση απέτυχε.';
+      try { detail = (await res.json()).detail || detail; } catch { /* όχι JSON */ }
+      throw new Error(detail);
+    }
+    llmEnabled = true;
+    $('llm-switch').checked = true;
+    if (captchaModal) captchaModal.hide();
+    refreshSummaries();
+  } catch (e) {
+    if (meta.llm.captcha_site_key) {
+      showCaptchaError(e.message);
+      if (window.turnstile && captchaWidget !== null) turnstile.reset(captchaWidget);
+    } else {
+      $('llm-switch').checked = false;
+      showAlert(e.message, 'danger');
+    }
+  }
+}
+
+async function disableLlm() {
+  llmEnabled = false;
+  if (summaryCtrl) summaryCtrl.abort();
+  try { await fetch('/api/llm/disable', { method: 'POST' }); } catch { /* εκτός σύνδεσης: το cookie λήγει μόνο του */ }
+  refreshSummaries();
+}
+
+function removeCaptcha() {
+  if (window.turnstile && captchaWidget !== null) turnstile.remove(captchaWidget);
+  captchaWidget = null;
+}
+
+function showCaptchaError(message) {
+  const box = $('captcha-error');
+  box.textContent = message;
+  box.classList.remove('d-none');
+}
+
+function refreshSummaries() {
+  if (!lastResult) return;
+  resetSummaries();
+  document.querySelectorAll('#peaks .summary').forEach((box) => { box.replaceChildren(); setupSummary(box, box.dataset.month, true); });
+  const panel = document.querySelector('#month-panel .summary');
+  if (panel && panel.dataset.month) { panel.replaceChildren(); setupSummary(panel, panel.dataset.month, false); }
 }
 
 // ---------------------------------------------------------------- άρθρα ανά μήνα

@@ -55,6 +55,10 @@ button.pill { line-height: 1.5; }
 .peak-stats strong { color: var(--text); }
 .month-card { border-left: 4px solid var(--primary-light); }
 
+/* Διακόπτης LLM */
+.llm-toggle { background: #eef4ff; border: 1px solid #dbe6fb; border-radius: 8px; padding: 8px 10px; }
+.llm-toggle .form-check-label { color: var(--primary); }
+
 /* Σύνοψη LLM */
 .summary ul { margin: 0 0 .25rem; padding-left: 1.1rem; }
 .summary li { margin-bottom: .2rem; }

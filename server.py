@@ -5,6 +5,7 @@
 Τεκμηρίωση API: /docs
 """
 
+import json
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ from src.env import load_env
 
 load_env()  # πρώτα το .env (τοπικά), ώστε τα παρακάτω modules να δουν τις ρυθμίσεις του
 
-from src import access, peaks  # noqa: E402
+from src import access, llm_gate, peaks  # noqa: E402
 from src.data_files import ensure_data
 from src.search import NewsIndex, make_query
 from src.summarize import BudgetExceeded, Summarizer, SummaryUnavailable
@@ -56,8 +57,10 @@ RATE_LIMITS = {
     "articles": (120, 60), "articles_all": (1200, 60),
     "summary": (40, 600), "summary_all": (400, 600),   # οι συνόψεις κοστίζουν· βλ. και το ημερήσιο όριο
     "login": (10, 900), "login_all": (100, 900),       # προσπάθειες εισόδου: προστασία από δοκιμές κωδικών
+    "llm_toggle": (20, 600), "llm_toggle_all": (300, 600),
 }
-BUCKETS = {"/api/search": "search", "/api/articles": "articles", "/api/summary": "summary"}
+BUCKETS = {"/api/search": "search", "/api/articles": "articles", "/api/summary": "summary",
+           "/api/llm/enable": "llm_toggle"}
 DOC_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 # Πόσοι αξιόπιστοι proxies βρίσκονται μπροστά από τον server (στο Hugging Face: TRUSTED_PROXY_HOPS στο Dockerfile).
@@ -68,7 +71,8 @@ TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
 # Επιτρέπεται μόνο το δικό μας origin, τα συγκεκριμένα CDN και η ενσωμάτωση στη σελίδα του Hugging Face.
 CSP = "; ".join([
     "default-src 'self'",
-    "script-src 'self' https://cdn.jsdelivr.net",
+    "script-src 'self' https://cdn.jsdelivr.net https://challenges.cloudflare.com",  # Turnstile («δεν είμαι ρομπότ»)
+    "frame-src https://challenges.cloudflare.com",
     "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net",  # το Plotly προσθέτει inline styles
     "font-src https://cdn.jsdelivr.net",
     "img-src 'self' data:",
@@ -218,7 +222,7 @@ AllForms = Annotated[bool, Query(description="Όλοι οι κλιτικοί τ�
 # ---------------------------------------------------------------- API
 
 @app.get("/api/meta", summary="Ρυθμίσεις για τη σελίδα")
-def meta():
+def meta(request: Request):
     idx = state["idx"]
     return {
         "categories": idx.categories,
@@ -228,6 +232,11 @@ def meta():
         "methods": peaks.METHODS,
         "max_term": MAX_TERM,
         "summaries": state["summarizer"].enabled,
+        "llm": {
+            "available": state["summarizer"].enabled and llm_gate.available(),
+            "enabled": llm_gate.token_valid(request.cookies.get(llm_gate.COOKIE)),
+            "captcha_site_key": llm_gate.SITE_KEY if llm_gate.captcha_configured() else None,
+        },
         "gated": access.enabled(),
         "source": SOURCE,
     }
@@ -300,12 +309,15 @@ def articles(
 
 @app.get("/api/summary", summary="Σύνοψη «τι συνέβη» σε έναν μήνα (LLM, από τους τίτλους των άρθρων)")
 def summary(
+    request: Request,
     q: Term,
     month: Annotated[str, Query(pattern=r"^\d{4}-\d{2}$", description="Μήνας ως ΕΕΕΕ-ΜΜ")],
     all_forms: AllForms = True,
     field: Field = "text",
     cat: Categories = None,
 ):
+    if not llm_gate.token_valid(request.cookies.get(llm_gate.COOKIE)):
+        raise HTTPException(403, "Οι αυτόματες συνόψεις είναι απενεργοποιημένες. Ενεργοποιήστε τις από τον διακόπτη.")
     term, cats = clean_term(q), clean_categories(cat)
     if month not in state["months"]:
         raise HTTPException(422, "Άγνωστος μήνας.")
@@ -321,6 +333,32 @@ def summary(
                   "Μπορεί να περιέχει ανακρίβειες — ελέγξτε τους τίτλους και τα πρωτότυπα άρθρα.",
         "source": SOURCE,
     }
+
+
+@app.post("/api/llm/enable", summary="Ενεργοποίηση συνόψεων (απαιτεί Turnstile token)")
+async def llm_enable(request: Request):
+    if not (state["summarizer"].enabled and llm_gate.available()):
+        raise HTTPException(503, "Οι αυτόματες συνόψεις δεν είναι διαθέσιμες.")
+    body = await request.body()
+    if len(body) > 4096:
+        raise HTTPException(413, "Πολύ μεγάλο αίτημα.")
+    try:
+        token = str(json.loads(body or b"{}").get("token") or "")
+    except (ValueError, AttributeError):
+        raise HTTPException(422, "Μη έγκυρο αίτημα.") from None
+    if not llm_gate.verify(token, client_ip(request)):
+        raise HTTPException(403, "Η επιβεβαίωση «δεν είμαι ρομπότ» απέτυχε. Δοκιμάστε ξανά.")
+    response = JSONResponse({"enabled": True})
+    response.set_cookie(llm_gate.COOKIE, llm_gate.new_token(), max_age=llm_gate.SECONDS,
+                        httponly=True, samesite="lax", secure=is_https(request), path="/")
+    return response
+
+
+@app.post("/api/llm/disable", summary="Απενεργοποίηση συνόψεων")
+def llm_disable():
+    response = JSONResponse({"enabled": False})
+    response.delete_cookie(llm_gate.COOKIE, path="/")
+    return response
 
 
 # ---------------------------------------------------------------- είσοδος με κωδικό

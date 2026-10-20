@@ -12,7 +12,8 @@ ENV HOME=/home/user \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TRUSTED_PROXY_HOPS=1 \
-    REQUIRE_ACCESS_CODE=1
+    REQUIRE_ACCESS_CODE=1 \
+    REQUIRE_CAPTCHA=1
 WORKDIR /home/user/app
 
 COPY --chown=user requirements.txt .
