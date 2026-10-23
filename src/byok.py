@@ -1,6 +1,7 @@
-"""«Φέρτε το δικό σας κλειδί» (BYOK): ο επισκέπτης χρησιμοποιεί το δικό του κλειδί Claude API για νέες συνόψεις.
+"""«Φέρτε το δικό σας κλειδί» (BYOK): ο επισκέπτης χρησιμοποιεί το δικό του κλειδί API για νέες συνόψεις, από
+τον πάροχο και το μοντέλο που διαλέγει (Claude ή ChatGPT — src/providers.py).
 
-- Το κλειδί κρατιέται ΜΟΝΟ στη μνήμη του server (μέσα στο client του Anthropic SDK) — ποτέ σε αρχείο, βάση,
+- Το κλειδί κρατιέται ΜΟΝΟ στη μνήμη του server (μέσα στο αντικείμενο του παρόχου) — ποτέ σε αρχείο, βάση,
   log, cookie, URL ή HTML. Μετά από επανεκκίνηση χάνεται.
 - Ο browser παίρνει τυχαίο αναγνωριστικό συνεδρίας (cookie), που δεν σχετίζεται με το κλειδί.
 - Η συνεδρία ισχύει 30 λεπτά και μόνο από την IP όπου επικολλήθηκε το κλειδί. Αν αλλάξει η IP, το κλειδί
@@ -10,18 +11,18 @@
 """
 
 import hashlib
-import re
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from src import providers
+
 COOKIE = "na_byok"
 SECONDS = 30 * 60
 RENEW_WINDOW = 5 * 60
 MAX_SESSIONS = 2000   # προστασία μνήμης
-KEY_PATTERN = re.compile(r"^sk-ant-[A-Za-z0-9_\-]{20,250}$")
 
 
 class KeyRequired(Exception):
@@ -37,8 +38,8 @@ class Session:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-def looks_like_key(key: str) -> bool:
-    return bool(KEY_PATTERN.match(key))
+def looks_like_key(provider: str, key: str) -> bool:
+    return providers.looks_like_key(provider, key)
 
 
 def _id(token: str) -> str:
@@ -71,7 +72,7 @@ class Store:
     def get(self, token: str | None, ip: str) -> Session:
         """Η ενεργή συνεδρία του επισκέπτη, αλλιώς KeyRequired με την αιτία."""
         if not token:
-            raise KeyRequired("Για νέες συνόψεις χρειάζεται το δικό σας κλειδί Claude API.")
+            raise KeyRequired("Για νέες συνόψεις χρειάζεται το δικό σας κλειδί API (Claude ή ChatGPT).")
         sid = _id(token)
         with self.lock:
             s = self.sessions.get(sid)
@@ -90,8 +91,10 @@ class Store:
             s = self.get(token, ip)
         except KeyRequired as e:
             return {"active": False, "reason": str(e) if token else None}
+        p = s.client  # ο πάροχος· ποτέ το ίδιο το κλειδί
         return {"active": True, "expires_in": int(s.expires - self.clock()), "renew_window": RENEW_WINDOW,
-                "used": s.used, "limit": self.limit}
+                "used": s.used, "limit": self.limit, "provider": getattr(p, "id", None),
+                "provider_label": getattr(p, "label", None), "model": getattr(p, "model", None)}
 
     def renew(self, token: str | None, ip: str) -> int:
         """Άλλα 30 λεπτά· μόνο στα τελευταία 5. Επιστρέφει τα δευτερόλεπτα που απομένουν."""
@@ -125,27 +128,17 @@ class Store:
             session.used += 1
 
 
-# ---------------------------------------------------------------- κλειδί → client
+# ---------------------------------------------------------------- κλειδί → πάροχος
 
-def make_client(key: str):
-    import anthropic
+def make_client(key: str, provider: str = providers.DEFAULT, model: str | None = None):
+    """Ο πάροχος με το κλειδί και το μοντέλο του επισκέπτη (το κλειδί μένει μόνο μέσα σε αυτό το αντικείμενο)."""
+    return providers.make(provider, key, model)
 
-    return anthropic.Anthropic(api_key=key, timeout=60.0, max_retries=2)
 
-
-def validate(client, model: str) -> str | None:
-    """Ελάχιστη, δωρεάν κλήση (στοιχεία του μοντέλου). None αν το κλειδί δουλεύει, αλλιώς μήνυμα για τον επισκέπτη.
-    Τα μηνύματα δεν περιέχουν ποτέ το κλειδί ή το κείμενο του σφάλματος του Anthropic."""
-    import anthropic
-
+def validate(client, model: str | None = None) -> str | None:
+    """Δωρεάν έλεγχος του κλειδιού (στοιχεία του μοντέλου). None αν δουλεύει, αλλιώς μήνυμα για τον επισκέπτη —
+    χωρίς ποτέ το κλειδί ή το κείμενο σφάλματος του παρόχου."""
     try:
-        client.with_options(timeout=15.0, max_retries=1).models.retrieve(model)
-    except anthropic.AuthenticationError:
-        return "Το κλειδί δεν έγινε δεκτό από το Anthropic. Ελέγξτε ότι το αντιγράψατε ολόκληρο."
-    except (anthropic.PermissionDeniedError, anthropic.NotFoundError):
-        return f"Το κλειδί δεν έχει πρόσβαση στο μοντέλο {model}."
-    except anthropic.RateLimitError:
-        return "Ο λογαριασμός σας στο Anthropic έφτασε το όριο αιτημάτων. Δοκιμάστε σε λίγο."
-    except (anthropic.APIStatusError, anthropic.APIConnectionError):
-        return "Δεν ήταν δυνατός ο έλεγχος του κλειδιού αυτή τη στιγμή. Δοκιμάστε ξανά."
-    return None
+        return client.validate()
+    except providers.SummaryUnavailable as e:
+        return str(e)

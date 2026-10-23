@@ -27,7 +27,7 @@ from src.env import load_env
 
 load_env()  # πρώτα το .env (τοπικά), ώστε τα παρακάτω modules να δουν τις ρυθμίσεις του
 
-from src import access, byok, llm_gate, peaks  # noqa: E402
+from src import access, byok, llm_gate, peaks, providers  # noqa: E402
 from src.data_files import ensure_data
 from src.search import NewsIndex, make_query
 from src.summarize import MODEL, BudgetExceeded, KeyRejected, NoClient, Summarizer, SummaryUnavailable
@@ -241,6 +241,8 @@ def meta(request: Request):
             "available": llm_gate.available(),
             "enabled": llm_gate.token_valid(request.cookies.get(llm_gate.COOKIE)),
             "model": MODEL,
+            "providers": providers.public_list(),
+            "default_provider": providers.DEFAULT,
             **llm_gate.client_config(),
         },
         "byok": keys.status(request.cookies.get(byok.COOKIE), client_ip(request)),
@@ -406,7 +408,7 @@ def is_local(request: Request) -> bool:
     return (request.client.host if request.client else "") in ("127.0.0.1", "::1")
 
 
-@app.post("/api/byok/key", summary="Επικόλληση κλειδιού Claude API (μόνο στη μνήμη, 30 λεπτά, μόνο από αυτή την IP)")
+@app.post("/api/byok/key", summary="Επικόλληση κλειδιού API — Claude ή ChatGPT, με επιλογή μοντέλου (μόνο στη μνήμη, 30 λεπτά, μόνο από αυτή την IP)")
 async def byok_key(request: Request):
     if not (is_https(request) or is_local(request)):
         raise HTTPException(403, "Το κλειδί στέλνεται μόνο μέσω HTTPS.")
@@ -419,16 +421,25 @@ async def byok_key(request: Request):
     try:
         payload = json.loads(body or b"{}")
         key = payload.get("key") if isinstance(payload, dict) else None
-        if not isinstance(key, str):
+        provider = payload.get("provider") if isinstance(payload, dict) else None
+        model = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(key, str) or not all(v is None or isinstance(v, str) for v in (provider, model)):
             raise ValueError
     except ValueError:
         raise HTTPException(422, "Μη έγκυρο αίτημα.") from None
     key = key.strip()
-    if not byok.looks_like_key(key):
-        raise HTTPException(422, "Αυτό δεν μοιάζει με κλειδί Claude API (ξεκινά με «sk-ant-»).")
-    client = byok.make_client(key)
+    provider = provider or providers.detect(key) or providers.DEFAULT
+    if provider not in providers.INFO:
+        raise HTTPException(422, "Άγνωστος πάροχος.")
+    model = model or providers.default_model(provider)
+    if model not in providers.model_ids(provider):  # μόνο μοντέλα της λίστας (π.χ. όχι κάποιο ακριβότερο)
+        raise HTTPException(422, "Μη διαθέσιμο μοντέλο για αυτόν τον πάροχο.")
+    if not byok.looks_like_key(provider, key):
+        info = providers.INFO[provider]
+        raise HTTPException(422, f"Αυτό δεν μοιάζει με κλειδί {info['label']} ({info['hint']}). Ελέγξτε τον πάροχο.")
+    client = byok.make_client(key, provider, model)
     del key, payload, body
-    error = await run_in_threadpool(byok.validate, client, MODEL)
+    error = await run_in_threadpool(byok.validate, client)
     if error:
         raise HTTPException(400, error)
     keys.forget(request.cookies.get(byok.COOKIE))  # ένα κλειδί ανά επισκέπτη

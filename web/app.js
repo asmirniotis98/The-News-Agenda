@@ -416,8 +416,10 @@ function renderByok() {
   row.classList.toggle('d-none', !llmEnabled);
   if (!llmEnabled) { $('byok-renew').classList.add('d-none'); return; }
   if (byokState.active) {
+    const model = (providerInfo(byokState.provider)?.models || []).find((m) => m.id === byokState.model);
     row.replaceChildren(el('i', { class: 'bi bi-key-fill me-1 text-success' }),
-      'Κλειδί ενεργό · σβήνεται σε ', el('strong', { id: 'byok-left' }),
+      `${byokState.provider_label || 'Κλειδί'} · ${model ? model.name : (byokState.model || '')} · σβήνεται σε `,
+      el('strong', { id: 'byok-left' }),
       ` · ${byokState.used}/${byokState.limit} νέες συνόψεις · `,
       linkButton('Διαγραφή κλειδιού', forgetKey));
   } else {
@@ -459,9 +461,54 @@ async function forgetKey() {
   setByok({ active: false });
 }
 
+// Βήματα του παραθύρου: 1. πάροχος (Claude / ChatGPT) → 2. μοντέλο από σταθερή λίστα → 3. κλειδί.
+let chosenProvider = null;
+
+function providerInfo(id) {
+  return meta.llm.providers.find((p) => p.id === id);
+}
+
+function buildProviderChoice() {
+  const group = $('provider-choice');
+  group.replaceChildren();
+  meta.llm.providers.forEach((p) => {
+    const input = el('input', { type: 'radio', class: 'btn-check', name: 'provider', id: `prov-${p.id}`, value: p.id });
+    input.addEventListener('change', () => selectProvider(p.id));
+    group.append(input, el('label', { class: 'btn btn-outline-primary btn-sm', for: `prov-${p.id}` },
+      el('strong', { text: p.label }), ` (${p.company})`));
+  });
+  $('model-select').addEventListener('change', showModelNote);
+  // Κλειδί άλλου παρόχου (π.χ. sk-ant- ενώ είναι επιλεγμένο το ChatGPT) → αλλάζει μόνος του ο πάροχος.
+  $('key-input').addEventListener('input', () => {
+    const v = $('key-input').value.trim();
+    const guess = v.startsWith('sk-ant-') ? 'anthropic' : (v.startsWith('sk-') ? 'openai' : null);
+    if (guess && guess !== chosenProvider && providerInfo(guess)) selectProvider(guess, true);
+  });
+}
+
+function selectProvider(id, keepKey = false) {
+  chosenProvider = id;
+  const p = providerInfo(id);
+  $(`prov-${id}`).checked = true;
+  const select = $('model-select');
+  select.replaceChildren(...p.models.map((m) =>
+    el('option', { value: m.id, text: `${m.name} — ${m.per_summary} ανά σύνοψη` })));
+  showModelNote();
+  $('key-input').placeholder = p.hint;
+  $('console-link').href = p.console;
+  $('console-link').textContent = `Πού βρίσκω κλειδί ${p.label}; (${p.company})`;
+  if (!keepKey) $('key-input').value = '';
+}
+
+function showModelNote() {
+  const m = providerInfo(chosenProvider).models.find((x) => x.id === $('model-select').value);
+  $('model-note').textContent = m ? `${m.note} · ${m.price} ανά 1M tokens (είσοδος / έξοδος)` : '';
+}
+
 function showKeyModal() {
   $('key-error').classList.add('d-none');
   $('key-input').value = '';
+  if (!chosenProvider) selectProvider(meta.llm.default_provider);
   keyModal.show();
 }
 
@@ -474,7 +521,7 @@ async function submitKey(event) {
   $('key-submit').disabled = true;
   $('key-error').classList.add('d-none');
   try {
-    setByok(await postJSON('/api/byok/key', { key }));
+    setByok(await postJSON('/api/byok/key', { provider: chosenProvider, model: $('model-select').value, key }));
     keyModal.hide();
     refreshSummaries();
   } catch (e) {
@@ -507,6 +554,7 @@ function setupLlmToggle() {
   });
   $('key-modal').addEventListener('hidden.bs.modal', () => { $('key-input').value = ''; });
   $('key-form').addEventListener('submit', submitKey);
+  buildProviderChoice();
   $('byok-renew-btn').addEventListener('click', renewKey);
   $('byok-renew-dismiss').addEventListener('click', () => { byokRenewDismissed = true; tickByok(); });
   setByok(meta.byok);

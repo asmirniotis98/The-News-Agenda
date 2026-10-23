@@ -235,7 +235,8 @@ elif scenario == "byok":
     from fastapi.testclient import TestClient
     import server
     from src import byok
-    byok.make_client = FakeClient  # never call the real API in tests
+    from src import providers as _prov
+    byok.make_client = lambda key, provider="anthropic", model=None: _prov.Anthropic(client=FakeClient(key), model=model)  # never call the real API
     clock = [_t.time()]
     server.keys.clock = lambda: clock[0]
 
@@ -303,3 +304,109 @@ elif scenario == "byok":
 
     text = logs.getvalue()
     ok(all(k not in text for k in (GOOD, BAD, REVOKED)), f"no key in the logs ({len(text.splitlines())} log lines checked)")
+
+elif scenario == "providers":
+    # Claude / ChatGPT with model choice. OpenAI through mocked HTTP; Claude through a fake SDK client. No real calls.
+    import logging
+    import httpx2
+    from src import providers as P
+    os.environ["SUMMARY_DB"] = os.path.join(tempfile.mkdtemp(), "s.sqlite")
+    os.environ["REQUIRE_CAPTCHA"] = "0"
+    os.environ["CAPTCHA_MODE"] = "none"  # the robot box is tested in llm_checkbox; here only providers and models
+    logs = []
+    logging.getLogger().addHandler(type("H", (logging.Handler,), {"emit": lambda self, r: logs.append(r.getMessage())})())
+    OAI, ANT = "sk-proj-" + "o" * 40, "sk-ant-" + "a" * 40
+    OK = '{"bullets": ["Πρώτο", "Δεύτερο"]}'
+    calls, state = [], {"status": 200, "body": None}
+
+    def fake_request(method, url, json=None, timeout=None, headers=None):
+        calls.append({"method": method, "url": url, "json": json, "headers": headers or {}})
+        if state["body"] is not None:
+            return httpx2.Response(state["status"], json=state["body"])
+        if url.endswith("/chat/completions"):
+            return httpx2.Response(200, json={"model": json["model"], "usage": {"prompt_tokens": 9, "completion_tokens": 3},
+                                              "choices": [{"finish_reason": "stop", "message": {"content": OK}}]})
+        return httpx2.Response(200, json={"id": url.rsplit("/", 1)[-1]})
+    P.httpx2.request = fake_request
+
+    def answer(status, body):
+        state.update(status=status, body=body)
+
+    ok(set(P.INFO) == {"anthropic", "openai"}, "only Claude and ChatGPT offered")
+    ok(P.model_ids("anthropic") == ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"]
+       and P.model_ids("openai") == ["gpt-5.4-nano", "gpt-5.4-mini"], "model lists (cheapest first = default)")
+    ok(P.detect(ANT) == "anthropic" and P.detect(OAI) == "openai" and P.detect("hello") is None, "provider detected from key prefix")
+    ok(P.parse_bullets("```json\n" + OK + "\n```") == ["Πρώτο", "Δεύτερο"], "lenient JSON parsing (```json … ```)")
+    try:
+        P.make("openai", OAI, "gpt-5.4"); ok(False, "model allowlist")
+    except ValueError:
+        ok(True, "model outside the list refused (gpt-5.4)")
+
+    calls.clear(); out = P.make("openai", OAI, "gpt-5.4-mini").complete("sys", "user", {"type": "object"})
+    c = calls[-1]
+    ok(out == OK and c["url"] == "https://api.openai.com/v1/chat/completions" and c["json"]["model"] == "gpt-5.4-mini",
+       "OpenAI: fixed endpoint, chosen model sent")
+    ok(c["headers"].get("Authorization") == "Bearer " + OAI and OAI not in c["url"], "OpenAI: key only in Authorization header")
+    ok(c["json"]["response_format"]["type"] == "json_schema" and c["json"]["response_format"]["json_schema"]["strict"], "OpenAI: strict JSON schema")
+    answer(429, {"error": {"code": "insufficient_quota"}})
+    try:
+        P.make("openai", OAI).complete("s", "u", {}); ok(False, "quota")
+    except P.KeyRejected as e:
+        ok(OAI not in str(e), f"OpenAI: no credit -> KeyRejected ({e})")
+    answer(429, {"error": {"code": "rate_limit_exceeded"}})
+    try:
+        P.make("openai", OAI).complete("s", "u", {}); ok(False, "busy")
+    except P.KeyRejected:
+        ok(False, "rate limit is not a bad key")
+    except P.SummaryUnavailable:
+        ok(True, "OpenAI: rate limit -> temporary error (key kept)")
+    answer(404, {})
+    ok("δεν έχει πρόσβαση" in P.make("openai", OAI).validate() and calls[-1]["method"] == "GET", "validate: free GET on the model; 404 -> no access")
+    answer(401, {"error": {"message": "Incorrect API key provided: sk-proj-oooo"}})
+    msg = P.make("openai", OAI).validate()
+    ok("δεν έγινε δεκτό" in msg and "sk-proj" not in msg, "validate: 401 -> rejected, provider text (with key) not echoed")
+    answer(200, None); state["body"] = None
+
+    from fastapi.testclient import TestClient
+    import server
+    from src import byok
+
+    class FakeAnthropic:  # Claude SDK stand-in: models.retrieve + beta.messages.create
+        def __init__(self):
+            self.models = SimpleNamespace(retrieve=lambda model: calls.append({"method": "GET", "url": "anthropic:" + model, "json": None, "headers": {}}))
+            self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
+        def with_options(self, **_):
+            return self
+        def create(self, **kw):
+            calls.append({"method": "POST", "url": "anthropic:messages", "json": kw, "headers": {}})
+            return SimpleNamespace(stop_reason="end_turn", model=kw["model"], usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                                   content=[SimpleNamespace(type="text", text=OK)])
+    real_make = byok.make_client
+    byok.make_client = lambda key, provider="anthropic", model=None: (
+        P.Anthropic(client=FakeAnthropic(), model=model or P.default_model("anthropic")) if provider == "anthropic"
+        else real_make(key, provider, model))
+
+    with TestClient(server.app, base_url="https://testserver") as cl:
+        prov = {p["id"]: p for p in cl.get("/api/meta").json()["llm"]["providers"]}
+        ok(set(prov) == {"anthropic", "openai"} and [m["id"] for m in prov["openai"]["models"]] == P.model_ids("openai"),
+           "meta: two providers with their models and prices")
+        assert cl.post("/api/llm/enable", json={}).status_code == 200
+        r = cl.post("/api/byok/key", json={"provider": "openai", "model": "gpt-5.4-mini", "key": OAI})
+        st = r.json()
+        ok(r.status_code == 200 and st.get("provider") == "openai" and st.get("model") == "gpt-5.4-mini" and OAI not in r.text,
+           "server: ChatGPT + GPT-5.4 mini -> active, key not echoed")
+        s = cl.get("/api/summary", params={"q": "μνημόνιο", "month": "2015-08"}).json()
+        ok(s["bullets"] == ["Πρώτο", "Δεύτερο"] and s["model"] == "gpt-5.4-mini", "server: summary written by the chosen model")
+        r = cl.post("/api/byok/key", json={"provider": "anthropic", "model": "claude-sonnet-5-5", "key": ANT})
+        ok(r.json().get("model") == "claude-sonnet-5-5", "server: Claude + Sonnet 5.5 -> active")
+        s = cl.get("/api/summary", params={"q": "μνημόνιο", "month": "2015-02"}).json()
+        ok(s["model"] == "claude-sonnet-5-5" and calls[-1]["json"]["model"] == "claude-sonnet-5-5", "server: Claude call uses the chosen model")
+        ok(cl.get("/api/summary", params={"q": "μνημόνιο", "month": "2015-08"}).json()["cached"], "cached summary (by GPT) shown to a Claude user")
+        ok(cl.post("/api/byok/key", json={"provider": "openai", "model": "gpt-5.4", "key": OAI}).status_code == 422, "server: model outside list -> 422")
+        ok(cl.post("/api/byok/key", json={"provider": "anthropic", "model": "gpt-5.4-nano", "key": ANT}).status_code == 422, "server: other provider's model -> 422")
+        r = cl.post("/api/byok/key", json={"provider": "openai", "key": ANT})
+        ok(r.status_code == 422 and "Ελέγξτε τον πάροχο" in r.json()["detail"] and ANT not in r.text, "server: Claude key under ChatGPT -> asks to check provider")
+        ok(cl.post("/api/byok/key", json={"provider": "gemini", "key": "AIza" + "g" * 35}).status_code == 422, "server: Gemini not accepted")
+        ok(all(c["url"].startswith(("https://api.openai.com/", "anthropic:")) for c in calls), "every outgoing request went to a fixed provider")
+    joined = "\n".join(logs)
+    ok(OAI not in joined and ANT not in joined, f"no key in the logs ({len(logs)} lines)")
