@@ -6,7 +6,10 @@
 - λίγες ταυτόχρονες κλήσεις,
 - μικρή απάντηση (έως 4 κουκκίδες).
 
-Χωρίς ANTHROPIC_API_KEY οι συνόψεις απλώς είναι απενεργοποιημένες.
+Ποιο κλειδί πληρώνει:
+- στον server: το κλειδί του επισκέπτη (BYOK, βλ. src/byok.py) — το summary() δέχεται το client του και ένα όριο
+  ανά συνεδρία· το ANTHROPIC_API_KEY του περιβάλλοντος δεν χρησιμοποιείται,
+- στα scripts (π.χ. αξιολόγηση): το ANTHROPIC_API_KEY από το .env, με ημερήσιο όριο DAILY_SUMMARY_LIMIT.
 """
 
 import hashlib
@@ -17,12 +20,13 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from src.search import NewsIndex, Query
 
 log = logging.getLogger("summarize")
 
-MODEL = os.environ.get("LLM_MODEL", "claude-opus-5-5")
+MODEL = os.environ.get("LLM_MODEL", "claude-haiku-5-5")  # φθηνό από προεπιλογή: με BYOK πληρώνει ο επισκέπτης
 DAILY_LIMIT = int(os.environ.get("DAILY_SUMMARY_LIMIT", "300"))
 MAX_CONCURRENT = 4
 MAX_TITLES = 80        # τίτλοι που στέλνονται ανά σύνοψη (όσοι έχουν τον όρο στον τίτλο πρώτοι)
@@ -59,8 +63,16 @@ class SummaryUnavailable(Exception):
     """Δεν υπάρχει κλειδί API ή το LLM δεν απάντησε."""
 
 
+class NoClient(SummaryUnavailable):
+    """Χρειάζεται νέα σύνοψη αλλά δεν υπάρχει κλειδί API."""
+
+
+class KeyRejected(SummaryUnavailable):
+    """Το Anthropic απέρριψε το κλειδί (άκυρο, ανακλήθηκε ή χωρίς υπόλοιπο)."""
+
+
 class BudgetExceeded(Exception):
-    """Εξαντλήθηκε το ημερήσιο όριο νέων συνόψεων."""
+    """Εξαντλήθηκε το όριο νέων συνόψεων (ημερήσιο ή ανά συνεδρία)."""
 
 
 def month_label(month: str) -> str:
@@ -69,10 +81,10 @@ def month_label(month: str) -> str:
 
 
 class Summarizer:
-    def __init__(self, index: NewsIndex, client=None, db: Path = DB):
+    def __init__(self, index: NewsIndex, client=None, db: Path = DB, env_key: bool = True):
         self.index = index
         self.client = client
-        if self.client is None and os.environ.get("ANTHROPIC_API_KEY"):
+        if self.client is None and env_key and os.environ.get("ANTHROPIC_API_KEY"):
             import anthropic
             self.client = anthropic.Anthropic(timeout=60.0, max_retries=2)
         self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -111,7 +123,10 @@ class Summarizer:
 
     # ---------------------------------------------------------------- κύρια λειτουργία
 
-    def summary(self, q: Query, month: str, field: str, cats: list[str]) -> dict:
+    def summary(self, q: Query, month: str, field: str, cats: list[str], client=None,
+                spend: Callable[[], None] | None = None) -> dict:
+        """Από την cache, αλλιώς νέα σύνοψη με το client (προεπιλογή: του περιβάλλοντος). Το spend() μετράει τη νέα
+        σύνοψη στο όριο (προεπιλογή: ημερήσιο όριο)· καλείται μόνο αν χρειάζεται κλήση στο LLM."""
         titles, n_articles = self.titles(q, month, field, cats)
         if not titles:
             return {"bullets": [], "cached": False, "n_titles": 0, "n_articles": 0, "model": None, "generated_at": None}
@@ -125,11 +140,12 @@ class Summarizer:
             return {"bullets": json.loads(row[0]), "cached": True, "n_titles": row[1], "n_articles": row[2],
                     "model": row[3], "generated_at": row[4]}
 
-        if not self.enabled:
-            raise SummaryUnavailable("Οι συνόψεις δεν είναι ενεργοποιημένες.")
-        self._spend_budget()
+        client = client or self.client
+        if client is None:
+            raise NoClient("Οι συνόψεις δεν είναι ενεργοποιημένες.")
+        (spend or self._spend_budget)()
         with self.slots:
-            bullets = self._call_llm(q.term, month, titles)
+            bullets = self._call_llm(client, q.term, month, titles)
         created = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with self.lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO summaries VALUES (?, ?, ?, ?, ?, ?)",
@@ -152,7 +168,7 @@ class Summarizer:
             row = self.db.execute("SELECT calls FROM usage WHERE day = ?", (day,)).fetchone()
         return row[0] if row else 0
 
-    def _call_llm(self, term: str, month: str, titles: list[str]) -> list[str]:
+    def _call_llm(self, client, term: str, month: str, titles: list[str]) -> list[str]:
         import anthropic
 
         listing = "\n".join(f"- {t}" for t in titles)
@@ -169,10 +185,16 @@ class Summarizer:
         if "haiku" not in MODEL:
             kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
         try:
-            response = self.client.beta.messages.create(**kwargs)
+            response = client.beta.messages.create(**kwargs)
         except anthropic.AuthenticationError as e:
-            log.error("LLM: μη έγκυρο κλειδί API")
-            raise SummaryUnavailable("Πρόβλημα ρύθμισης των συνόψεων.") from e
+            log.warning("LLM: το κλειδί API απορρίφθηκε")
+            raise KeyRejected("Το κλειδί API δεν έγινε δεκτό από το Anthropic (ίσως ανακλήθηκε).") from e
+        except anthropic.BadRequestError as e:
+            # Το Anthropic απαντά 400 όταν ο λογαριασμός δεν έχει υπόλοιπο.
+            if "credit balance" in str(e).lower():
+                raise KeyRejected("Ο λογαριασμός σας στο Anthropic δεν έχει αρκετό υπόλοιπο.") from e
+            log.warning("LLM: σφάλμα %s", type(e).__name__)
+            raise SummaryUnavailable("Η σύνοψη δεν είναι διαθέσιμη αυτή τη στιγμή.") from e
         except anthropic.RateLimitError as e:
             raise SummaryUnavailable("Η υπηρεσία συνόψεων είναι προσωρινά απασχολημένη.") from e
         except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:

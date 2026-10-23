@@ -2,6 +2,7 @@
 
 Εκτέλεση από τον φάκελο του project, ένα σενάριο κάθε φορά (οι ρυθμίσεις διαβάζονται κατά την εκκίνηση):
     python tests/scenarios.py gate | misconfigured | short | summarizer claude-opus-5-5 | summarizer claude-haiku-5-5
+                              | llm_checkbox | byok
 """
 import json
 import os
@@ -36,9 +37,9 @@ if scenario == "gate":
         ok("HttpOnly" in sc and "Secure" in sc and "SameSite=lax" in sc.replace("samesite", "SameSite"), f"cookie flags: {sc.split(';',1)[1].strip()[:80]}")
         ok(c.get("/api/search", params={"q": "abc"}).status_code == 200, "with cookie -> API works")
         ok(c.get("/").status_code == 200 and c.get("/docs").status_code == 200, "with cookie -> page and docs work")
-        m = c.get("/api/meta").json(); ok(m["gated"] is True and m["summaries"] is False, "meta: gated, summaries off (no key)")
+        m = c.get("/api/meta").json(); ok(m["gated"] is True and m["byok"]["active"] is False, "meta: gated, no visitor key")
         r = c.get("/api/summary", params={"q": "μνημόνιο", "month": "2015-08"}); ok(r.status_code == 403, f"summary with LLM switch off -> 403 ({r.json()['detail']})")
-        ok(c.post("/api/llm/enable", json={}).status_code == 503, "no API key -> switch cannot be enabled (503)")
+        ok(c.post("/api/llm/enable", json={}).status_code == 403, "switch needs the robot check (403)")
         c.cookies.set("na_session", "9999999999.deadbeef"); ok(c.get("/api/search", params={"q": "abc"}).status_code == 401, "forged cookie rejected")
         c.cookies.clear()
         codes = [c.post("/login", content="code=nope", headers={"content-type": "application/x-www-form-urlencoded"}).headers["location"] for _ in range(12)]
@@ -185,3 +186,120 @@ elif scenario == "llm_checkbox":
         c.post("/api/llm/disable"); c.cookies.clear()
         ok(en({"challenge": ch, "confirm": True, "website": ""}) == 403, "same challenge reused -> rejected")
         ok(c.get("/api/summary", params=q).status_code == 403, "after disabling -> 403 (new box needed)")
+
+elif scenario == "byok":
+    # Bring your own key: the visitor's key lives only in server memory, 30 min, bound to the visitor's IP.
+    import io
+    import logging
+    import time as _t
+
+    import anthropic
+    import httpx
+
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-owner-key-must-never-be-used-000000"  # local test value only
+    os.environ["SUMMARY_DB"] = os.path.join(tempfile.mkdtemp(), "s.sqlite")
+    os.environ["REQUIRE_CAPTCHA"] = "1"
+    os.environ["TRUSTED_PROXY_HOPS"] = "1"
+    os.environ["BYOK_SESSION_LIMIT"] = "3"
+    GOOD = "sk-ant-test-good-" + "a" * 30   # fake test keys
+    BAD = "sk-ant-test-bad-" + "b" * 30
+    REVOKED = "sk-ant-test-revoked-" + "c" * 30
+
+    def api_error(cls, status):
+        return cls("rejected", response=httpx.Response(status, request=httpx.Request("GET", "https://api.test")), body=None)
+
+    class FakeClient:
+        def __init__(self, key):
+            self.key = key
+            self.models = SimpleNamespace(retrieve=self.retrieve)
+            self.beta = SimpleNamespace(messages=SimpleNamespace(create=self.create))
+
+        def with_options(self, **_):
+            return self
+
+        def retrieve(self, model):
+            if self.key == BAD:
+                raise api_error(anthropic.AuthenticationError, 401)
+            return SimpleNamespace(id=model)
+
+        def create(self, **kw):
+            if self.key == REVOKED:
+                raise api_error(anthropic.AuthenticationError, 401)
+            return SimpleNamespace(stop_reason="end_turn", model=kw["model"],
+                                   usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                                   content=[SimpleNamespace(type="text", text=json.dumps({"bullets": ["Δοκιμή"]}))])
+
+    logs = io.StringIO()
+    logging.getLogger().addHandler(logging.StreamHandler(logs))
+    logging.getLogger().setLevel(logging.DEBUG)  # όλα τα logs, και του Anthropic SDK / httpx
+    from fastapi.testclient import TestClient
+    import server
+    from src import byok
+    byok.make_client = FakeClient  # never call the real API in tests
+    clock = [_t.time()]
+    server.keys.clock = lambda: clock[0]
+
+    with TestClient(server.app, base_url="https://testserver") as c:
+        c.headers["x-forwarded-for"] = "203.0.113.5"
+        ok(server.state["summarizer"].client is None, "owner's ANTHROPIC_API_KEY is ignored by the server")
+        m = c.get("/api/meta").json()
+        ok(m["llm"]["available"] and m["byok"] == {"active": False, "reason": None}, "meta: summaries available, no key")
+        ok(c.post("/api/byok/key", json={"key": GOOD}).status_code == 403, "key before robot check -> 403")
+        ch = c.get("/api/llm/challenge").json()["challenge"]; _t.sleep(1.7)
+        ok(c.post("/api/llm/enable", json={"challenge": ch, "confirm": True, "website": ""}).status_code == 200, "robot check passed")
+        q = {"q": "μνημόνιο", "month": "2015-08"}
+        r = c.get("/api/summary", params=q)
+        ok(r.status_code == 428 and r.json()["key_required"], "new summary without key -> 428 key_required")
+
+        r = c.post("http://testserver/api/byok/key", json={"key": GOOD})
+        ok(r.status_code == 403 and "HTTPS" in r.json()["detail"], "key over plain HTTP -> refused")
+        r = c.post("/api/byok/key", json={"key": "not-a-key-" + "x" * 30})
+        ok(r.status_code == 422 and "not-a-key" not in r.text, "malformed key -> 422, value not echoed")
+        r = c.post("/api/byok/key", json={"key": 12345})
+        ok(r.status_code == 422 and "12345" not in r.text, "non-string key -> 422, value not echoed")
+        r = c.post("/api/byok/key", json={"key": BAD})
+        ok(r.status_code == 400 and BAD not in r.text and "byok" not in str(r.headers.get("set-cookie")), "rejected key -> 400, no session")
+        r = c.post("/api/byok/key", json={"key": GOOD})
+        sc = r.headers.get("set-cookie", "")
+        ok(r.status_code == 200 and r.json()["active"] and 1790 <= r.json()["expires_in"] <= 1800, "valid key -> active for 30 min")
+        ok(GOOD not in r.text and GOOD not in sc, "key not in response or cookie")
+        ok(all(f in sc for f in ("HttpOnly", "Secure", "Path=/api")) and "samesite=strict" in sc.lower()
+           and "max-age" not in sc.lower(), "cookie: HttpOnly, Secure, SameSite=Strict, /api, session-only")
+
+        a = c.get("/api/summary", params=q).json()
+        ok(a["bullets"] == ["Δοκιμή"] and not a["cached"], "summary with visitor key")
+        ok(c.get("/api/byok/status").json()["used"] == 1, "new summary counted on the session")
+        ok(c.get("/api/summary", params=q).json()["cached"] and c.get("/api/byok/status").json()["used"] == 1, "cached summary not counted")
+        c.get("/api/summary", params={**q, "month": "2015-02"}); c.get("/api/summary", params={**q, "month": "2015-03"})
+        r = c.get("/api/summary", params={**q, "month": "2015-04"})
+        ok(r.status_code == 429, f"session limit (3) reached -> 429 ({r.json()['detail'][:40]}…)")
+
+        ok(c.post("/api/byok/renew").status_code == 409, "renew too early (> 5 min left) -> 409")
+        clock[0] += 26 * 60
+        r = c.post("/api/byok/renew")
+        ok(r.status_code == 200 and r.json()["expires_in"] == 1800, "renew in last 5 min -> 30 min again")
+        clock[0] += 31 * 60
+        s = c.get("/api/byok/status").json()
+        ok(not s["active"] and "30 λεπτά" in s["reason"], "after 30 min -> key gone")
+
+        c.post("/api/byok/key", json={"key": GOOD})
+        c.headers["x-forwarded-for"] = "198.51.100.7"
+        r = c.get("/api/summary", params={**q, "month": "2014-10"})
+        ok(r.status_code == 428 and "IP" in r.json()["detail"], "different IP -> 428, key dropped")
+        c.headers["x-forwarded-for"] = "203.0.113.5"
+        ok(not c.get("/api/byok/status").json()["active"], "back on the first IP -> still gone (must paste again)")
+        ok(c.get("/api/summary", params=q).json()["cached"], "cached summaries still shown without a key")
+
+        c.post("/api/byok/key", json={"key": REVOKED})
+        r = c.get("/api/summary", params={**q, "month": "2013-03"})
+        ok(r.status_code == 428 and not c.get("/api/byok/status").json()["active"], "key revoked at Anthropic -> 428, session dropped")
+
+        c.post("/api/byok/key", json={"key": GOOD})
+        c.post("/api/byok/forget")
+        ok(not c.get("/api/byok/status").json()["active"] and not server.keys.sessions, "forget -> key removed from memory")
+        c.post("/api/byok/key", json={"key": GOOD})
+        c.post("/api/llm/disable")
+        ok(not server.keys.sessions, "switching summaries off also removes the key")
+
+    text = logs.getvalue()
+    ok(all(k not in text for k in (GOOD, BAD, REVOKED)), f"no key in the logs ({len(text.splitlines())} log lines checked)")
