@@ -59,6 +59,7 @@
               <label class="form-check-label fw-semibold" for="llm-switch"><i class="bi bi-stars"></i> Αυτόματες συνόψεις (LLM)</label>
             </div>
             <div class="small text-muted" id="llm-note">«Τι συνέβη» σε κάθε κορύφωση, από γλωσσικό μοντέλο.</div>
+            <div class="small byok-row d-none" id="byok-row" aria-live="polite"></div>
           </div>
 
           <!-- Σε κινητά τα φίλτρα κρύβονται πίσω από κουμπί, ώστε το γράφημα να φαίνεται νωρίς. -->
@@ -189,6 +190,54 @@
       </div>
     </div>
   </div>
+</div>
+
+<div class="modal fade" id="key-modal" tabindex="-1" aria-labelledby="key-title" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="modal-title h5" id="key-title"><i class="bi bi-key"></i> Το δικό σας κλειδί API</h2>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Κλείσιμο"></button>
+      </div>
+      <form id="key-form" autocomplete="off">
+        <div class="modal-body">
+          <p class="small">Οι συνόψεις που υπάρχουν ήδη εμφανίζονται χωρίς κλειδί. Για <strong>νέες</strong> συνόψεις
+            διαλέξτε πάροχο και μοντέλο και επικολλήστε το δικό σας κλειδί API· το κόστος χρεώνεται στον λογαριασμό σας.</p>
+
+          <div class="form-label small fw-semibold mb-1">1. Πάροχος</div>
+          <div class="btn-group w-100 mb-3" role="group" aria-label="Πάροχος" id="provider-choice"></div>
+
+          <label class="form-label small fw-semibold mb-1" for="model-select">2. Μοντέλο για την ανάλυση</label>
+          <select class="form-select form-select-sm" id="model-select"></select>
+          <div class="small text-muted mt-1 mb-3" id="model-note"></div>
+
+          <label class="form-label small fw-semibold mb-1" for="key-input">3. Κλειδί API</label>
+          <input class="form-control font-monospace" type="password" id="key-input" placeholder="sk-ant-…"
+                 autocomplete="off" spellcheck="false" autocapitalize="off" maxlength="300" required>
+          <div class="small mt-1"><a id="console-link" href="#" target="_blank" rel="noopener noreferrer">Πού βρίσκω κλειδί;</a></div>
+          <ul class="small text-muted mt-3 mb-0 ps-3">
+            <li>Δεν αποθηκεύεται πουθενά: κρατιέται μόνο στη μνήμη του server και σβήνεται σε 30 λεπτά (ή αν
+              απενεργοποιήσετε τις συνόψεις).</li>
+            <li>Λειτουργεί μόνο από τη σημερινή σας σύνδεση (IP). Αν αλλάξει, θα το ζητήσουμε ξανά.</li>
+            <li>Στέλνεται μόνο στον πάροχο που διαλέξατε. Προτείνουμε ξεχωριστό κλειδί με όριο χρέωσης, που θα
+              ανακαλέσετε μετά.</li>
+          </ul>
+          <div id="key-error" class="text-danger small mt-2 d-none" role="alert"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Χωρίς κλειδί</button>
+          <button type="submit" class="btn btn-primary" id="key-submit">Χρήση κλειδιού</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="alert alert-warning shadow byok-renew d-none" id="byok-renew" role="alert">
+  <div class="small mb-2"><i class="bi bi-clock-history me-1"></i>Το κλειδί σας σβήνεται σε <strong id="byok-renew-left"></strong>.
+    Θέλετε άλλα 30 λεπτά;</div>
+  <button type="button" class="btn btn-sm btn-warning" id="byok-renew-btn">Ανανέωση</button>
+  <button type="button" class="btn btn-sm btn-link" id="byok-renew-dismiss">Όχι</button>
 </div>
 
 <template id="peak-template">

@@ -18,6 +18,12 @@ let llmEnabled = false;   // ο επισκέπτης άνοιξε τον δια�
 let captchaModal = null;
 let captchaWidget = null;
 let turnstileLoading = null;
+let keyModal = null;
+let openKeyAfterCaptcha = false;  // μετά το «δεν είμαι ρομπότ» ανοίγει το παράθυρο του κλειδιού
+let byokState = { active: false };  // από /api/byok/* — ποτέ το ίδιο το κλειδί
+let byokExpiresAt = 0;
+let byokTimer = null;
+let byokRenewDismissed = false;
 
 // ---------------------------------------------------------------- βοηθητικά
 
@@ -59,6 +65,22 @@ async function getJSON(path, params, signal) {
     throw err;
   }
   return res.json();
+}
+
+async function postJSON(path, payload = {}) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  let body = {};
+  try { body = await res.json(); } catch { /* όχι JSON */ }
+  if (!res.ok) {
+    const err = new Error(typeof body.detail === 'string' ? body.detail : `Σφάλμα ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
 }
 
 // ---------------------------------------------------------------- κατάσταση φίλτρων ↔ URL
@@ -350,10 +372,163 @@ async function loadSummary(box) {
       el('div', { class: 'summary-title' }, el('i', { class: 'bi bi-stars me-1' }), 'Τι συνέβη'),
       list,
       el('div', { class: 'summary-notice', text: `${s.notice} (${s.n_titles} τίτλοι · ${s.model})` })));
+    if (!s.cached && byokState.active) { byokState.used += 1; renderByok(); }
   } catch (e) {
     if (e.name === 'AbortError') return;
-    if (e.status === 403) { llmEnabled = false; $('llm-switch').checked = false; }  // π.χ. έληξε η ενεργοποίηση
+    if (e.status === 403) { llmEnabled = false; $('llm-switch').checked = false; renderByok(); }  // π.χ. έληξε η ενεργοποίηση
+    if (e.status === 428) {  // δεν υπάρχει έτοιμη σύνοψη και χρειάζεται κλειδί
+      if (byokState.active) setByok({ active: false, reason: e.message });
+      const add = el('button', { type: 'button', class: 'btn btn-sm btn-outline-primary ms-2', text: 'Προσθήκη κλειδιού' });
+      add.addEventListener('click', () => showKeyModal());
+      box.replaceChildren(el('div', { class: 'text-muted small' }, el('i', { class: 'bi bi-key me-1' }),
+        'Δεν υπάρχει ακόμη σύνοψη για αυτόν τον μήνα· για νέα σύνοψη χρειάζεται το δικό σας κλειδί.', add));
+      return;
+    }
     box.replaceChildren(el('div', { class: 'text-muted small' }, el('i', { class: 'bi bi-info-circle me-1' }), e.message));
+  }
+}
+
+// ---------------------------------------------------------------- κλειδί του επισκέπτη (BYOK)
+
+function setByok(state) {
+  byokState = state;
+  byokRenewDismissed = false;
+  byokExpiresAt = state.active ? Date.now() + state.expires_in * 1000 : 0;
+  clearInterval(byokTimer);
+  byokTimer = state.active ? setInterval(tickByok, 1000) : null;
+  renderByok();
+  tickByok();
+}
+
+function mmss(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function linkButton(text, onClick) {
+  const b = el('button', { type: 'button', class: 'btn btn-link', text });
+  b.addEventListener('click', onClick);
+  return b;
+}
+
+function renderByok() {
+  const row = $('byok-row');
+  row.classList.toggle('d-none', !llmEnabled);
+  if (!llmEnabled) { $('byok-renew').classList.add('d-none'); return; }
+  if (byokState.active) {
+    const model = (providerInfo(byokState.provider)?.models || []).find((m) => m.id === byokState.model);
+    row.replaceChildren(el('i', { class: 'bi bi-key-fill me-1 text-success' }),
+      `${byokState.provider_label || 'Κλειδί'} · ${model ? model.name : (byokState.model || '')} · σβήνεται σε `,
+      el('strong', { id: 'byok-left' }),
+      ` · ${byokState.used}/${byokState.limit} νέες συνόψεις · `,
+      linkButton('Διαγραφή κλειδιού', forgetKey));
+  } else {
+    row.replaceChildren(
+      ...(byokState.reason ? [el('div', { class: 'text-danger mb-1', text: byokState.reason })] : []),
+      el('i', { class: 'bi bi-key me-1' }), 'Χωρίς κλειδί: μόνο όσες συνόψεις υπάρχουν ήδη. ',
+      linkButton('Προσθήκη κλειδιού', () => showKeyModal()));
+  }
+}
+
+function tickByok() {
+  if (!byokState.active) { $('byok-renew').classList.add('d-none'); return; }
+  const left = (byokExpiresAt - Date.now()) / 1000;
+  if (left <= 0) {
+    setByok({ active: false, reason: 'Τα 30 λεπτά έληξαν και το κλειδί σβήστηκε. Επικολλήστε το ξανά για νέες συνόψεις.' });
+    return;
+  }
+  const counter = $('byok-left');
+  if (counter) counter.textContent = mmss(left);
+  $('byok-renew-left').textContent = mmss(left);
+  const show = llmEnabled && left <= byokState.renew_window && !byokRenewDismissed;
+  $('byok-renew').classList.toggle('d-none', !show);
+}
+
+async function renewKey() {
+  $('byok-renew-btn').disabled = true;
+  try {
+    setByok(await postJSON('/api/byok/renew'));
+  } catch (e) {
+    if (e.status === 428) setByok({ active: false, reason: e.message });
+    else showAlert(e.message, 'warning');
+  } finally {
+    $('byok-renew-btn').disabled = false;
+  }
+}
+
+async function forgetKey() {
+  try { await postJSON('/api/byok/forget'); } catch { /* το κλειδί λήγει μόνο του σε 30 λεπτά */ }
+  setByok({ active: false });
+}
+
+// Βήματα του παραθύρου: 1. πάροχος (Claude / ChatGPT) → 2. μοντέλο από σταθερή λίστα → 3. κλειδί.
+let chosenProvider = null;
+
+function providerInfo(id) {
+  return meta.llm.providers.find((p) => p.id === id);
+}
+
+function buildProviderChoice() {
+  const group = $('provider-choice');
+  group.replaceChildren();
+  meta.llm.providers.forEach((p) => {
+    const input = el('input', { type: 'radio', class: 'btn-check', name: 'provider', id: `prov-${p.id}`, value: p.id });
+    input.addEventListener('change', () => selectProvider(p.id));
+    group.append(input, el('label', { class: 'btn btn-outline-primary btn-sm', for: `prov-${p.id}` },
+      el('strong', { text: p.label }), ` (${p.company})`));
+  });
+  $('model-select').addEventListener('change', showModelNote);
+  // Κλειδί άλλου παρόχου (π.χ. sk-ant- ενώ είναι επιλεγμένο το ChatGPT) → αλλάζει μόνος του ο πάροχος.
+  $('key-input').addEventListener('input', () => {
+    const v = $('key-input').value.trim();
+    const guess = v.startsWith('sk-ant-') ? 'anthropic' : (v.startsWith('sk-') ? 'openai' : null);
+    if (guess && guess !== chosenProvider && providerInfo(guess)) selectProvider(guess, true);
+  });
+}
+
+function selectProvider(id, keepKey = false) {
+  chosenProvider = id;
+  const p = providerInfo(id);
+  $(`prov-${id}`).checked = true;
+  const select = $('model-select');
+  select.replaceChildren(...p.models.map((m) =>
+    el('option', { value: m.id, text: `${m.name} — ${m.per_summary} ανά σύνοψη` })));
+  showModelNote();
+  $('key-input').placeholder = p.hint;
+  $('console-link').href = p.console;
+  $('console-link').textContent = `Πού βρίσκω κλειδί ${p.label}; (${p.company})`;
+  if (!keepKey) $('key-input').value = '';
+}
+
+function showModelNote() {
+  const m = providerInfo(chosenProvider).models.find((x) => x.id === $('model-select').value);
+  $('model-note').textContent = m ? `${m.note} · ${m.price} ανά 1M tokens (είσοδος / έξοδος)` : '';
+}
+
+function showKeyModal() {
+  $('key-error').classList.add('d-none');
+  $('key-input').value = '';
+  if (!chosenProvider) selectProvider(meta.llm.default_provider);
+  keyModal.show();
+}
+
+async function submitKey(event) {
+  event.preventDefault();
+  const input = $('key-input');
+  const key = input.value.trim();
+  input.value = '';  // το κλειδί δεν μένει στη σελίδα
+  if (!key) return;
+  $('key-submit').disabled = true;
+  $('key-error').classList.add('d-none');
+  try {
+    setByok(await postJSON('/api/byok/key', { provider: chosenProvider, model: $('model-select').value, key }));
+    keyModal.hide();
+    refreshSummaries();
+  } catch (e) {
+    $('key-error').textContent = e.message;
+    $('key-error').classList.remove('d-none');
+  } finally {
+    $('key-submit').disabled = false;
   }
 }
 
@@ -370,11 +545,19 @@ function setupLlmToggle() {
   sw.checked = llmEnabled;
   sw.addEventListener('change', () => (sw.checked ? enableLlm() : disableLlm()));
   captchaModal = new bootstrap.Modal($('captcha-modal'));
+  keyModal = new bootstrap.Modal($('key-modal'));
   // Κλείσιμο του παραθύρου χωρίς επιβεβαίωση → ο διακόπτης γυρίζει πίσω.
   $('captcha-modal').addEventListener('hidden.bs.modal', () => {
     removeCaptcha();
     if (!llmEnabled) $('llm-switch').checked = false;
+    if (openKeyAfterCaptcha) { openKeyAfterCaptcha = false; showKeyModal(); }
   });
+  $('key-modal').addEventListener('hidden.bs.modal', () => { $('key-input').value = ''; });
+  $('key-form').addEventListener('submit', submitKey);
+  buildProviderChoice();
+  $('byok-renew-btn').addEventListener('click', renewKey);
+  $('byok-renew-dismiss').addEventListener('click', () => { byokRenewDismissed = true; tickByok(); });
+  setByok(meta.byok);
 }
 
 function loadTurnstile() {
@@ -393,7 +576,8 @@ function loadTurnstile() {
 }
 
 async function enableLlm() {
-  if (!meta.llm.captcha_site_key) { activateLlm(''); return; }  // τοπικά, χωρίς κλειδιά Turnstile
+  if (meta.llm.captcha === 'checkbox') { showCheckbox(); return; }
+  if (!meta.llm.captcha_site_key) { activateLlm({}); return; }  // τοπικά, χωρίς επιβεβαίωση
   $('captcha-error').classList.add('d-none');
   captchaModal.show();
   try {
@@ -407,18 +591,55 @@ async function enableLlm() {
     sitekey: meta.llm.captcha_site_key,
     language: 'el',
     theme: 'light',
-    callback: (token) => activateLlm(token),
+    callback: (token) => activateLlm({ token }),
     'error-callback': () => showCaptchaError('Η επιβεβαίωση απέτυχε. Δοκιμάστε ξανά.'),
     'expired-callback': () => showCaptchaError('Η επιβεβαίωση έληξε. Τικάρετε ξανά το κουτί.'),
   });
 }
 
-async function activateLlm(token) {
+// Δικό μας κουτί: πρόκληση μίας χρήσης από τον server, κουτί, κρυφό πεδίο-«παγίδα» για bots.
+async function showCheckbox(keepError = false) {
+  if (!keepError) $('captcha-error').classList.add('d-none');
+  const box = $('captcha-box');
+  box.replaceChildren(el('div', { class: 'text-muted small' },
+    el('span', { class: 'spinner-border spinner-border-sm me-1' }), 'Φόρτωση…'));
+  captchaModal.show();
+  let ch;
+  try {
+    ch = await getJSON('/api/llm/challenge', new URLSearchParams());
+  } catch (e) {
+    box.replaceChildren();
+    showCaptchaError(e.message);
+    return;
+  }
+  const started = Date.now();
+  const check = el('input', { class: 'form-check-input', type: 'checkbox', id: 'robot-check' });
+  const trap = el('input', { type: 'text', name: 'website', tabindex: '-1', autocomplete: 'off', 'aria-hidden': 'true',
+    class: 'robot-trap' });
+  const go = el('button', { type: 'button', class: 'btn btn-primary w-100 mt-3', text: 'Ενεργοποίηση' });
+  go.disabled = true;
+  check.addEventListener('change', () => { go.disabled = !check.checked; });
+  go.addEventListener('click', async () => {
+    go.disabled = true;
+    // Ο server δέχεται την επιβεβαίωση μόνο μετά από χρόνο ανθρώπου· αν ο χρήστης ήταν πολύ γρήγορος, περιμένουμε.
+    const wait = ch.min_seconds * 1000 + 200 - (Date.now() - started);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    await activateLlm({ challenge: ch.challenge, confirm: check.checked, website: trap.value });
+    if (!llmEnabled) showCheckbox(true);  // νέα πρόκληση για νέα προσπάθεια, με το μήνυμα λάθους ορατό
+  });
+  box.replaceChildren(el('div', { class: 'w-100' },
+    el('div', { class: 'robot-box' },
+      el('div', { class: 'form-check mb-0' }, check,
+        el('label', { class: 'form-check-label fw-semibold', for: 'robot-check', text: 'Δεν είμαι ρομπότ' }))),
+    trap, go));
+}
+
+async function activateLlm(payload) {
   try {
     const res = await fetch('/api/llm/enable', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       let detail = 'Η ενεργοποίηση απέτυχε.';
@@ -427,10 +648,13 @@ async function activateLlm(token) {
     }
     llmEnabled = true;
     $('llm-switch').checked = true;
-    if (captchaModal) captchaModal.hide();
+    renderByok();
+    if (!byokState.active) openKeyAfterCaptcha = true;
+    if (captchaModal && $('captcha-modal').classList.contains('show')) captchaModal.hide();
+    else if (openKeyAfterCaptcha) { openKeyAfterCaptcha = false; showKeyModal(); }
     refreshSummaries();
   } catch (e) {
-    if (meta.llm.captcha_site_key) {
+    if (meta.llm.captcha) {
       showCaptchaError(e.message);
       if (window.turnstile && captchaWidget !== null) turnstile.reset(captchaWidget);
     } else {
@@ -443,7 +667,9 @@ async function activateLlm(token) {
 async function disableLlm() {
   llmEnabled = false;
   if (summaryCtrl) summaryCtrl.abort();
+  // Ο server σβήνει και το κλειδί από τη μνήμη του.
   try { await fetch('/api/llm/disable', { method: 'POST' }); } catch { /* εκτός σύνδεσης: το cookie λήγει μόνο του */ }
+  setByok({ active: false });
   refreshSummaries();
 }
 

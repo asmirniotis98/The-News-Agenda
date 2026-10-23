@@ -21,15 +21,16 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from src.env import load_env
 
 load_env()  # πρώτα το .env (τοπικά), ώστε τα παρακάτω modules να δουν τις ρυθμίσεις του
 
-from src import access, llm_gate, peaks  # noqa: E402
+from src import access, byok, llm_gate, peaks, providers  # noqa: E402
 from src.data_files import ensure_data
 from src.search import NewsIndex, make_query
-from src.summarize import BudgetExceeded, Summarizer, SummaryUnavailable
+from src.summarize import MODEL, BudgetExceeded, KeyRejected, NoClient, Summarizer, SummaryUnavailable
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -58,9 +59,11 @@ RATE_LIMITS = {
     "summary": (40, 600), "summary_all": (400, 600),   # οι συνόψεις κοστίζουν· βλ. και το ημερήσιο όριο
     "login": (10, 900), "login_all": (100, 900),       # προσπάθειες εισόδου: προστασία από δοκιμές κωδικών
     "llm_toggle": (20, 600), "llm_toggle_all": (300, 600),
+    "byok_key": (10, 900), "byok_key_all": (200, 900),  # επικόλληση κλειδιού: όχι εργαλείο δοκιμής κλεμμένων κλειδιών
 }
 BUCKETS = {"/api/search": "search", "/api/articles": "articles", "/api/summary": "summary",
-           "/api/llm/enable": "llm_toggle"}
+           "/api/llm/enable": "llm_toggle", "/api/llm/challenge": "llm_toggle",
+           "/api/byok/key": "byok_key", "/api/byok/renew": "llm_toggle"}
 DOC_PATHS = {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}
 
 # Πόσοι αξιόπιστοι proxies βρίσκονται μπροστά από τον server (στο Hugging Face: TRUSTED_PROXY_HOPS στο Dockerfile).
@@ -128,6 +131,8 @@ class RateLimiter:
 
 
 limiter = RateLimiter(RATE_LIMITS)
+# Κλειδιά επισκεπτών (BYOK): μόνο στη μνήμη αυτής της διεργασίας, άρα ο server πρέπει να τρέχει με έναν worker.
+keys = byok.Store(limit=int(os.environ.get("BYOK_SESSION_LIMIT", "50")))
 state: dict = {}
 
 
@@ -137,7 +142,7 @@ async def lifespan(_: FastAPI):
     idx = NewsIndex()
     state["idx"] = idx
     state["months"] = [pd.Timestamp(m).strftime("%Y-%m") for m in idx.months.month]
-    state["summarizer"] = Summarizer(idx)
+    state["summarizer"] = Summarizer(idx, env_key=False)  # μόνο κλειδιά επισκεπτών, ποτέ του ιδιοκτήτη
     yield
     idx.con.close()
 
@@ -231,12 +236,16 @@ def meta(request: Request):
         "examples": EXAMPLES,
         "methods": peaks.METHODS,
         "max_term": MAX_TERM,
-        "summaries": state["summarizer"].enabled,
+        "summaries": llm_gate.available(),
         "llm": {
-            "available": state["summarizer"].enabled and llm_gate.available(),
+            "available": llm_gate.available(),
             "enabled": llm_gate.token_valid(request.cookies.get(llm_gate.COOKIE)),
-            "captcha_site_key": llm_gate.SITE_KEY if llm_gate.captcha_configured() else None,
+            "model": MODEL,
+            "providers": providers.public_list(),
+            "default_provider": providers.DEFAULT,
+            **llm_gate.client_config(),
         },
+        "byok": keys.status(request.cookies.get(byok.COOKIE), client_ip(request)),
         "gated": access.enabled(),
         "source": SOURCE,
     }
@@ -321,10 +330,24 @@ def summary(
     term, cats = clean_term(q), clean_categories(cat)
     if month not in state["months"]:
         raise HTTPException(422, "Άγνωστος μήνας.")
+    # Συνόψεις που υπάρχουν ήδη (cache) εμφανίζονται σε όλους· νέες μόνο με το κλειδί του επισκέπτη.
+    session, why = None, None
     try:
-        result = state["summarizer"].summary(make_query(term, all_forms), month, field, cats)
+        session = keys.get(request.cookies.get(byok.COOKIE), client_ip(request))
+    except byok.KeyRequired as e:
+        why = str(e)
+    try:
+        result = state["summarizer"].summary(
+            make_query(term, all_forms), month, field, cats,
+            client=session.client if session else None,
+            spend=(lambda: keys.spend(session)) if session else None)
+    except NoClient:
+        return key_required(why)
+    except KeyRejected as e:
+        keys.drop(session)
+        return key_required(f"{e} Το κλειδί σβήστηκε· μπορείτε να επικολλήσετε άλλο.")
     except BudgetExceeded as e:
-        raise HTTPException(429, f"{e} Εμφανίζονται μόνο όσες έχουν ήδη δημιουργηθεί· δοκιμάστε ξανά αύριο.") from e
+        raise HTTPException(429, str(e)) from e
     except SummaryUnavailable as e:
         raise HTTPException(503, str(e)) from e
     return {
@@ -335,18 +358,26 @@ def summary(
     }
 
 
-@app.post("/api/llm/enable", summary="Ενεργοποίηση συνόψεων (απαιτεί Turnstile token)")
+@app.get("/api/llm/challenge", summary="Πρόκληση μίας χρήσης για το κουτί «δεν είμαι ρομπότ»")
+def llm_challenge():
+    return {"challenge": llm_gate.new_challenge(), "min_seconds": llm_gate.MIN_HUMAN_SECONDS}
+
+
+@app.post("/api/llm/enable", summary="Ενεργοποίηση συνόψεων (απαιτεί επιβεβαίωση «δεν είμαι ρομπότ»)")
 async def llm_enable(request: Request):
-    if not (state["summarizer"].enabled and llm_gate.available()):
+    if not llm_gate.available():
         raise HTTPException(503, "Οι αυτόματες συνόψεις δεν είναι διαθέσιμες.")
     body = await request.body()
     if len(body) > 4096:
         raise HTTPException(413, "Πολύ μεγάλο αίτημα.")
     try:
-        token = str(json.loads(body or b"{}").get("token") or "")
-    except (ValueError, AttributeError):
+        payload = json.loads(body or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError
+    except ValueError:
         raise HTTPException(422, "Μη έγκυρο αίτημα.") from None
-    if not llm_gate.verify(token, client_ip(request)):
+    # Η επαλήθευση καλεί το Cloudflare (έως ~30 s): σε ξεχωριστό νήμα, ώστε να μην παγώνει τον server για τους άλλους.
+    if not await run_in_threadpool(llm_gate.verify, payload, client_ip(request)):
         raise HTTPException(403, "Η επιβεβαίωση «δεν είμαι ρομπότ» απέτυχε. Δοκιμάστε ξανά.")
     response = JSONResponse({"enabled": True})
     response.set_cookie(llm_gate.COOKIE, llm_gate.new_token(), max_age=llm_gate.SECONDS,
@@ -354,10 +385,96 @@ async def llm_enable(request: Request):
     return response
 
 
-@app.post("/api/llm/disable", summary="Απενεργοποίηση συνόψεων")
-def llm_disable():
+@app.post("/api/llm/disable", summary="Απενεργοποίηση συνόψεων (σβήνει και το κλειδί του επισκέπτη)")
+def llm_disable(request: Request):
+    keys.forget(request.cookies.get(byok.COOKIE))
     response = JSONResponse({"enabled": False})
     response.delete_cookie(llm_gate.COOKIE, path="/")
+    response.delete_cookie(byok.COOKIE, path="/api")
+    return response
+
+
+# ---------------------------------------------------------------- κλειδί του επισκέπτη (BYOK)
+
+def key_required(reason: str | None) -> JSONResponse:
+    """428: χρειάζεται (νέο) κλειδί. Σβήνει και το cookie, αφού η συνεδρία δεν ισχύει πια."""
+    response = JSONResponse({"detail": reason or "Για νέες συνόψεις χρειάζεται το δικό σας κλειδί Claude API.",
+                             "key_required": True}, status_code=428)
+    response.delete_cookie(byok.COOKIE, path="/api")
+    return response
+
+
+def is_local(request: Request) -> bool:
+    return (request.client.host if request.client else "") in ("127.0.0.1", "::1")
+
+
+@app.post("/api/byok/key", summary="Επικόλληση κλειδιού API — Claude ή ChatGPT, με επιλογή μοντέλου (μόνο στη μνήμη, 30 λεπτά, μόνο από αυτή την IP)")
+async def byok_key(request: Request):
+    if not (is_https(request) or is_local(request)):
+        raise HTTPException(403, "Το κλειδί στέλνεται μόνο μέσω HTTPS.")
+    if not llm_gate.token_valid(request.cookies.get(llm_gate.COOKIE)):
+        raise HTTPException(403, "Ενεργοποιήστε πρώτα τις συνόψεις (επιβεβαίωση «δεν είμαι ρομπότ»).")
+    body = await request.body()
+    if len(body) > 1024:
+        raise HTTPException(413, "Πολύ μεγάλο αίτημα.")
+    # Το σώμα διαβάζεται με το χέρι: τα σφάλματα επικύρωσης του FastAPI θα έστελναν πίσω την τιμή, δηλαδή το κλειδί.
+    try:
+        payload = json.loads(body or b"{}")
+        key = payload.get("key") if isinstance(payload, dict) else None
+        provider = payload.get("provider") if isinstance(payload, dict) else None
+        model = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(key, str) or not all(v is None or isinstance(v, str) for v in (provider, model)):
+            raise ValueError
+    except ValueError:
+        raise HTTPException(422, "Μη έγκυρο αίτημα.") from None
+    key = key.strip()
+    provider = provider or providers.detect(key) or providers.DEFAULT
+    if provider not in providers.INFO:
+        raise HTTPException(422, "Άγνωστος πάροχος.")
+    model = model or providers.default_model(provider)
+    if model not in providers.model_ids(provider):  # μόνο μοντέλα της λίστας (π.χ. όχι κάποιο ακριβότερο)
+        raise HTTPException(422, "Μη διαθέσιμο μοντέλο για αυτόν τον πάροχο.")
+    if not byok.looks_like_key(provider, key):
+        info = providers.INFO[provider]
+        raise HTTPException(422, f"Αυτό δεν μοιάζει με κλειδί {info['label']} ({info['hint']}). Ελέγξτε τον πάροχο.")
+    client = byok.make_client(key, provider, model)
+    del key, payload, body
+    error = await run_in_threadpool(byok.validate, client)
+    if error:
+        raise HTTPException(400, error)
+    keys.forget(request.cookies.get(byok.COOKIE))  # ένα κλειδί ανά επισκέπτη
+    ip = client_ip(request)
+    token = keys.create(client, ip)
+    if token is None:
+        raise HTTPException(503, "Πάρα πολλοί ενεργοί επισκέπτες. Δοκιμάστε ξανά σε λίγο.")
+    response = JSONResponse(keys.status(token, ip))
+    # Cookie συνεδρίας (χωρίς max_age: σβήνει με το κλείσιμο του browser)· τα 30 λεπτά ελέγχονται στον server.
+    response.set_cookie(byok.COOKIE, token, httponly=True, samesite="strict", secure=is_https(request), path="/api")
+    return response
+
+
+@app.get("/api/byok/status", summary="Κατάσταση του κλειδιού του επισκέπτη (χωρίς το ίδιο το κλειδί)")
+def byok_status(request: Request):
+    return keys.status(request.cookies.get(byok.COOKIE), client_ip(request))
+
+
+@app.post("/api/byok/renew", summary="Ανανέωση για άλλα 30 λεπτά (μόνο τα τελευταία 5 λεπτά)")
+def byok_renew(request: Request):
+    token, ip = request.cookies.get(byok.COOKIE), client_ip(request)
+    try:
+        keys.renew(token, ip)
+    except byok.KeyRequired as e:
+        return key_required(str(e))
+    except ValueError as e:
+        raise HTTPException(409, str(e)) from None
+    return keys.status(token, ip)
+
+
+@app.post("/api/byok/forget", summary="Διαγραφή του κλειδιού από τη μνήμη του server")
+def byok_forget(request: Request):
+    keys.forget(request.cookies.get(byok.COOKIE))
+    response = JSONResponse({"active": False})
+    response.delete_cookie(byok.COOKIE, path="/api")
     return response
 
 

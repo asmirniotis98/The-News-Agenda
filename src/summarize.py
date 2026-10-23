@@ -1,12 +1,16 @@
-"""Σύνοψη «τι συνέβη» σε μια κορύφωση, με LLM (Claude), με βάση τους τίτλους των άρθρων του μήνα.
+"""Σύνοψη «τι συνέβη» σε μια κορύφωση, με LLM, με βάση τους τίτλους των άρθρων του μήνα.
 
 Προστασία κόστους:
-- cache (SQLite): κάθε σύνοψη (όρος, φίλτρα, μήνας, μοντέλο) δημιουργείται μία φορά,
+- cache (SQLite): κάθε σύνοψη (όρος, φίλτρα, μήνας) δημιουργείται μία φορά και εμφανίζεται σε όλους, όποιο μοντέλο
+  κι αν την έγραψε (το μοντέλο φαίνεται κάτω από τη σύνοψη),
 - ημερήσιο όριο κλήσεων στο LLM (DAILY_SUMMARY_LIMIT),
 - λίγες ταυτόχρονες κλήσεις,
 - μικρή απάντηση (έως 4 κουκκίδες).
 
-Χωρίς ANTHROPIC_API_KEY οι συνόψεις απλώς είναι απενεργοποιημένες.
+Ποιο κλειδί πληρώνει:
+- στον server: το κλειδί του επισκέπτη (BYOK, βλ. src/byok.py), σε όποιον πάροχο επιλέξει (src/providers.py) — το
+  summary() δέχεται τον πάροχο και το μοντέλο του και ένα όριο ανά συνεδρία· το ANTHROPIC_API_KEY του περιβάλλοντος δεν χρησιμοποιείται,
+- στα scripts (π.χ. αξιολόγηση): το ANTHROPIC_API_KEY από το .env, με ημερήσιο όριο DAILY_SUMMARY_LIMIT.
 """
 
 import hashlib
@@ -17,18 +21,24 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
+from src.providers import SCRIPT_MODEL, KeyRejected, NoClient, Provider, SummaryUnavailable, parse_bullets
+from src.providers import Anthropic as AnthropicProvider
 from src.search import NewsIndex, Query
 
 log = logging.getLogger("summarize")
 
-MODEL = os.environ.get("LLM_MODEL", "claude-opus-5-5")
+# Τα σφάλματα ορίζονται στο src/providers.py· εκτίθενται και από εδώ για τον server και τα scripts.
+__all__ = ["Summarizer", "BudgetExceeded", "SummaryUnavailable", "NoClient", "KeyRejected", "MODEL", "month_label"]
+
+MODEL = SCRIPT_MODEL  # μοντέλο του Claude για τα scripts (π.χ. αξιολόγηση) — LLM_MODEL
 DAILY_LIMIT = int(os.environ.get("DAILY_SUMMARY_LIMIT", "300"))
 MAX_CONCURRENT = 4
 MAX_TITLES = 80        # τίτλοι που στέλνονται ανά σύνοψη (όσοι έχουν τον όρο στον τίτλο πρώτοι)
 MAX_TITLE_CHARS = 200
 MAX_BULLETS = 4
-PROMPT_VERSION = "v1"  # αλλάζει όταν αλλάζει το prompt, ώστε να μη σερβίρονται παλιές συνόψεις
+PROMPT_VERSION = "v2"  # αλλάζει όταν αλλάζει το prompt ή η μορφή της cache (v2: χωρίς το μοντέλο στο κλειδί)
 DB = Path(os.environ.get("SUMMARY_DB", Path(__file__).resolve().parents[1] / "data" / "summaries.sqlite"))
 
 MONTHS_GR = ["Ιανουάριος", "Φεβρουάριος", "Μάρτιος", "Απρίλιος", "Μάιος", "Ιούνιος",
@@ -55,12 +65,8 @@ SCHEMA = {
 }
 
 
-class SummaryUnavailable(Exception):
-    """Δεν υπάρχει κλειδί API ή το LLM δεν απάντησε."""
-
-
 class BudgetExceeded(Exception):
-    """Εξαντλήθηκε το ημερήσιο όριο νέων συνόψεων."""
+    """Εξαντλήθηκε το όριο νέων συνόψεων (ημερήσιο ή ανά συνεδρία)."""
 
 
 def month_label(month: str) -> str:
@@ -69,10 +75,10 @@ def month_label(month: str) -> str:
 
 
 class Summarizer:
-    def __init__(self, index: NewsIndex, client=None, db: Path = DB):
+    def __init__(self, index: NewsIndex, client=None, db: Path = DB, env_key: bool = True):
         self.index = index
         self.client = client
-        if self.client is None and os.environ.get("ANTHROPIC_API_KEY"):
+        if self.client is None and env_key and os.environ.get("ANTHROPIC_API_KEY"):
             import anthropic
             self.client = anthropic.Anthropic(timeout=60.0, max_retries=2)
         self.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
@@ -105,13 +111,16 @@ class Summarizer:
 
     @staticmethod
     def cache_key(q: Query, month: str, field: str, cats: list[str]) -> str:
-        raw = json.dumps({"v": PROMPT_VERSION, "model": MODEL, "words": q.words, "field": field,
+        raw = json.dumps({"v": PROMPT_VERSION, "words": q.words, "field": field,
                           "cats": sorted(cats), "month": month}, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode()).hexdigest()
 
     # ---------------------------------------------------------------- κύρια λειτουργία
 
-    def summary(self, q: Query, month: str, field: str, cats: list[str]) -> dict:
+    def summary(self, q: Query, month: str, field: str, cats: list[str], client=None,
+                spend: Callable[[], None] | None = None) -> dict:
+        """Από την cache, αλλιώς νέα σύνοψη με το client (προεπιλογή: του περιβάλλοντος). Το spend() μετράει τη νέα
+        σύνοψη στο όριο (προεπιλογή: ημερήσιο όριο)· καλείται μόνο αν χρειάζεται κλήση στο LLM."""
         titles, n_articles = self.titles(q, month, field, cats)
         if not titles:
             return {"bullets": [], "cached": False, "n_titles": 0, "n_articles": 0, "model": None, "generated_at": None}
@@ -125,17 +134,21 @@ class Summarizer:
             return {"bullets": json.loads(row[0]), "cached": True, "n_titles": row[1], "n_articles": row[2],
                     "model": row[3], "generated_at": row[4]}
 
-        if not self.enabled:
-            raise SummaryUnavailable("Οι συνόψεις δεν είναι ενεργοποιημένες.")
-        self._spend_budget()
+        client = client or self.client
+        if client is None:
+            raise NoClient("Οι συνόψεις δεν είναι ενεργοποιημένες.")
+        # Πάροχος του επισκέπτη (src/providers.py)· ένα σκέτο client του Anthropic SDK τυλίγεται ως Claude.
+        provider = client if isinstance(client, Provider) else AnthropicProvider(client=client)
+        (spend or self._spend_budget)()
         with self.slots:
-            bullets = self._call_llm(q.term, month, titles)
+            bullets = self._call_llm(provider, q.term, month, titles)
         created = datetime.now(timezone.utc).isoformat(timespec="seconds")
         with self.lock, self.db:
             self.db.execute("INSERT OR REPLACE INTO summaries VALUES (?, ?, ?, ?, ?, ?)",
-                            (key, json.dumps(bullets, ensure_ascii=False), len(titles), n_articles, MODEL, created))
+                            (key, json.dumps(bullets, ensure_ascii=False), len(titles), n_articles, provider.model,
+                             created))
         return {"bullets": bullets, "cached": False, "n_titles": len(titles), "n_articles": n_articles,
-                "model": MODEL, "generated_at": created}
+                "model": provider.model, "generated_at": created}
 
     def _spend_budget(self) -> None:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -152,43 +165,9 @@ class Summarizer:
             row = self.db.execute("SELECT calls FROM usage WHERE day = ?", (day,)).fetchone()
         return row[0] if row else 0
 
-    def _call_llm(self, term: str, month: str, titles: list[str]) -> list[str]:
-        import anthropic
-
+    def _call_llm(self, provider: Provider, term: str, month: str, titles: list[str]) -> list[str]:
         listing = "\n".join(f"- {t}" for t in titles)
         user = (f"Όρος: «{term}»\nΜήνας: {month_label(month)}\nΤίτλοι άρθρων ({len(titles)}):\n"
                 f"<titles>\n{listing}\n</titles>")
-        kwargs = dict(
-            model=MODEL,
-            max_tokens=4000,  # περιθώριο για τη σκέψη του μοντέλου· η απάντηση είναι μικρή
-            system=SYSTEM,
-            messages=[{"role": "user", "content": user}],
-            output_config={"effort": "low", "format": {"type": "json_schema", "schema": SCHEMA}},
-        )
-        # Server-side fallback σε περίπτωση άρνησης· δεν υπάρχει για τα μοντέλα Haiku.
-        if "haiku" not in MODEL:
-            kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
-        try:
-            response = self.client.beta.messages.create(**kwargs)
-        except anthropic.AuthenticationError as e:
-            log.error("LLM: μη έγκυρο κλειδί API")
-            raise SummaryUnavailable("Πρόβλημα ρύθμισης των συνόψεων.") from e
-        except anthropic.RateLimitError as e:
-            raise SummaryUnavailable("Η υπηρεσία συνόψεων είναι προσωρινά απασχολημένη.") from e
-        except (anthropic.APIStatusError, anthropic.APIConnectionError) as e:
-            log.warning("LLM: σφάλμα %s", type(e).__name__)
-            raise SummaryUnavailable("Η σύνοψη δεν είναι διαθέσιμη αυτή τη στιγμή.") from e
-
-        u = response.usage
-        # Μόνο αριθμοί για την παρακολούθηση κόστους — κανένα δεδομένο του επισκέπτη.
-        log.info("LLM: model=%s in=%s out=%s stop=%s", response.model, u.input_tokens, u.output_tokens,
-                 response.stop_reason)
-        if response.stop_reason == "refusal":
-            raise SummaryUnavailable("Δεν ήταν δυνατή η σύνοψη για αυτόν τον μήνα.")
-        text = next((b.text for b in response.content if b.type == "text"), "")
-        try:
-            bullets = json.loads(text)["bullets"]
-        except (ValueError, KeyError, TypeError) as e:
-            raise SummaryUnavailable("Η σύνοψη δεν είναι διαθέσιμη αυτή τη στιγμή.") from e
+        bullets = parse_bullets(provider.complete(SYSTEM, user, SCHEMA))
         return [" ".join(str(b).split()).lstrip("•-– ") for b in bullets if str(b).strip()][:MAX_BULLETS]
-
