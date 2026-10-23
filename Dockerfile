@@ -7,12 +7,13 @@ RUN useradd -m -u 1000 user
 USER user
 # TRUSTED_PROXY_HOPS: ο proxy του Hugging Face προσθέτει την πραγματική IP του επισκέπτη ως ΤΕΛΕΥΤΑΙΑ τιμή
 # του X-Forwarded-For (ελέγχθηκε 20/10/2026) — βλ. client_ip() στο server.py.
+# Η εφαρμογή είναι ανοιχτή σε όλους (από 23/10/2026). Για να ξανακλείσει με κωδικό: REQUIRE_ACCESS_CODE=1 εδώ
+# και secret ACCESS_CODE στο Space (βλ. src/access.py).
 ENV HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TRUSTED_PROXY_HOPS=1 \
-    REQUIRE_ACCESS_CODE=1 \
     REQUIRE_CAPTCHA=1
 WORKDIR /home/user/app
 
