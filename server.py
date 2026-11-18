@@ -37,8 +37,9 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
 
-EXAMPLES = ["μνημόνιο", "πανδημία", "ακρίβεια", "μεταναστευτικό", "σεισμός", "Ουκρανία", "ενεργειακή κρίση"]
-MAX_TERM = 60
+EXAMPLES = ["μνημόνιο", "πανδημία", "ακρίβεια", "μεταναστευτικό", "σεισμός", "Ουκρανία", "ενεργειακή κρίση",
+            "κορωνοϊός | κορονοϊός"]
+MAX_TERM = 100  # αρκεί για έως 5 εναλλακτικούς όρους με «|»
 ARTICLE_URL = re.compile(r"^https://(www\.)?amna\.gr/")
 
 # Άδεια δεδομένων CC BY-NC-ND 4.0: αναφορά δημιουργού, άδειας και πηγής σε κάθε απάντηση με δεδομένα.
@@ -210,6 +211,14 @@ def clean_term(q: str) -> str:
     return q
 
 
+def build_query(term: str, all_forms: bool):
+    """Ο όρος έτοιμος για αναζήτηση· 422 αν δεν έχει λέξεις ή έχει πάρα πολλούς εναλλακτικούς όρους."""
+    try:
+        return make_query(term, all_forms)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+
+
 def clean_categories(cats: list[str] | None) -> list[str]:
     cats = cats or []
     unknown = set(cats) - set(state["idx"].categories)
@@ -218,7 +227,7 @@ def clean_categories(cats: list[str] | None) -> list[str]:
     return cats
 
 
-Term = Annotated[str, Query(min_length=1, max_length=MAX_TERM, description="Λέξη ή φράση, π.χ. «μνημόνιο»")]
+Term = Annotated[str, Query(min_length=1, max_length=MAX_TERM, description="Λέξη ή φράση, π.χ. «μνημόνιο»· εναλλακτικοί όροι με «|», π.χ. «πανδημία | κορωνοϊός» (έως 5)")]
 Field = Annotated[Literal["text", "title"], Query(description="Αναζήτηση σε τίτλο + κείμενο ή μόνο σε τίτλους")]
 Categories = Annotated[list[str] | None, Query(alias="cat", description="Κατηγορίες (επαναλαμβανόμενη παράμετρος)")]
 AllForms = Annotated[bool, Query(description="Όλοι οι κλιτικοί τύποι της λέξης")]
@@ -264,7 +273,7 @@ def search(
     n: Annotated[int, Query(ge=1, le=10)] = 6,
 ):
     term, cats = clean_term(q), clean_categories(cat)
-    query = make_query(term, all_forms)
+    query = build_query(term, all_forms)
     df = state["idx"].monthly(query, field, cats)
     df = df[df["month"].dt.year.between(year_from, year_to)].reset_index(drop=True)
     pk = peaks.detect(df, method, n, column=metric)
@@ -303,7 +312,7 @@ def articles(
     term, cats = clean_term(q), clean_categories(cat)
     if month not in state["months"]:
         raise HTTPException(422, "Άγνωστος μήνας.")
-    df = state["idx"].articles(make_query(term, all_forms), month + "-01", field, cats)
+    df = state["idx"].articles(build_query(term, all_forms), month + "-01", field, cats)
     page = df.iloc[offset:offset + limit]
     return {
         "total": len(df),
@@ -338,7 +347,7 @@ def summary(
         why = str(e)
     try:
         result = state["summarizer"].summary(
-            make_query(term, all_forms), month, field, cats,
+            build_query(term, all_forms), month, field, cats,
             client=session.client if session else None,
             spend=(lambda: keys.spend(session)) if session else None)
     except NoClient:

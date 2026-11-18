@@ -46,9 +46,10 @@
             <label for="term" class="form-label fw-semibold">Όρος</label>
             <div class="input-group">
               <span class="input-group-text"><i class="bi bi-search"></i></span>
-              <input id="term" class="form-control" type="search" maxlength="60" placeholder="π.χ. μνημόνιο" required>
+              <input id="term" class="form-control" type="search" maxlength="100" placeholder="π.χ. μνημόνιο" required aria-describedby="term-help">
               <button class="btn btn-primary" type="submit" title="Αναζήτηση"><i class="bi bi-arrow-right"></i><span class="visually-hidden">Αναζήτηση</span></button>
             </div>
+            <div class="form-text" id="term-help">Πολλοί όροι μαζί με <kbd>|</kbd> (ή): π.χ. «πανδημία | κορωνοϊός».</div>
           </form>
 
           <div class="mt-2" id="examples" aria-label="Παραδείγματα"></div>

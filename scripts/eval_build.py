@@ -88,7 +88,7 @@ def precision_cases(idx: NewsIndex) -> list[dict]:
             ids = [r[0] for r in sample]
             texts = dict(raw.execute(f"SELECT id, text_clean FROM read_parquet('{RAW.as_posix()}') WHERE id IN (SELECT unnest($ids))",
                                      {"ids": ids}).fetchall())
-        stem = q.words[0][0]
+        stem = q.phrases[0].words[0][0]
         for aid, created, category, title, url in sorted(sample, key=lambda r: r[1]):
             out.append({"term": term, "label": q.label, "date": created.strftime("%Y-%m-%d"), "category": category,
                         "title": title, "url": url, "snippet": snippet(title + " — " + (texts.get(aid) or ""), stem)})
