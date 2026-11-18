@@ -25,18 +25,21 @@ MIN_STEM = 4
 FIELDS = {"text": "text_norm", "title": "title_norm"}
 
 
-@dataclass(frozen=True)
-class Query:
-    """Ένας όρος έτοιμος για αναζήτηση: μία ή περισσότερες λέξεις, η καθεμία ως πρόθεμα ή ακριβής λέξη."""
+# Εναλλακτικοί όροι χωρίζονται με «|»: «πανδημία | κορωνοϊός» = άρθρα με τον έναν Ή τον άλλο όρο.
+OR = "|"
+MAX_ALTERNATIVES = 5
 
-    term: str                            # όπως τον έγραψε ο χρήστης
+
+@dataclass(frozen=True)
+class Phrase:
+    """Μία λέξη ή φράση: οι λέξεις της, η καθεμία ως πρόθεμα ή ακριβής λέξη."""
+
     words: tuple[tuple[str, bool], ...]  # (κανονικοποιημένη λέξη ή θέμα, True αν αναζητείται ως πρόθεμα)
 
     @property
-    def pattern(self) -> str:
-        # Το  του RE2 είναι μόνο ASCII, οπότε τα όρια λέξης ορίζονται με κλάση γραμμάτων Unicode.
+    def regex(self) -> str:
         parts = [_escape(w) + (r"\p{L}*" if prefix else "") for w, prefix in self.words]
-        return r"(^|[^\p{L}])" + r"[^\p{L}]+".join(parts) + r"([^\p{L}]|$)"
+        return r"[^\p{L}]+".join(parts)
 
     @property
     def anchor(self) -> str:
@@ -46,6 +49,32 @@ class Query:
     @property
     def label(self) -> str:
         return " ".join(w + ("…" if prefix else "") for w, prefix in self.words)
+
+
+@dataclass(frozen=True)
+class Query:
+    """Ένας όρος έτοιμος για αναζήτηση: μία ή περισσότερες εναλλακτικές φράσεις (OR)."""
+
+    term: str                    # όπως τον έγραψε ο χρήστης
+    phrases: tuple[Phrase, ...]  # ένα άρθρο ταιριάζει αν περιέχει οποιαδήποτε από αυτές
+
+    @property
+    def pattern(self) -> str:
+        # Το \b του RE2 είναι μόνο ASCII, οπότε τα όρια λέξης ορίζονται με κλάση γραμμάτων Unicode.
+        return r"(^|[^\p{L}])(" + "|".join(p.regex for p in self.phrases) + r")([^\p{L}]|$)"
+
+    @property
+    def anchors(self) -> list[str]:
+        return [p.anchor for p in self.phrases]
+
+    @property
+    def label(self) -> str:
+        return " | ".join(p.label for p in self.phrases)
+
+    @property
+    def key(self) -> list:
+        """Σταθερή μορφή για κλειδιά cache: ίδιο αποτέλεσμα για «α | β» και «β | α»."""
+        return sorted([list(map(list, p.words)) for p in self.phrases])
 
 
 def _escape(text: str) -> str:
@@ -62,14 +91,24 @@ def stem(word: str) -> str:
 
 def make_query(term: str, all_forms: bool = True) -> Query:
     """all_forms=True: κάθε λέξη ως θέμα + οποιαδήποτε κατάληξη. Λέξεις έως 4 γράμματα (π.χ. «ΕΚΤ»)
-    αναζητούνται πάντα ακριβώς, αλλιώς θα ταίριαζαν με άσχετες λέξεις («εκτός»)."""
-    parts = []
-    for w in normalize(term).split():
-        if all_forms and len(w) > MIN_STEM:
-            parts.append((stem(w), True))
-        else:
-            parts.append((w, False))
-    return Query(term=term.strip(), words=tuple(parts))
+    αναζητούνται πάντα ακριβώς, αλλιώς θα ταίριαζαν με άσχετες λέξεις («εκτός»).
+    Εναλλακτικοί όροι με «|» (έως MAX_ALTERNATIVES)· κενοί ή επαναλαμβανόμενοι αγνοούνται."""
+    phrases = []
+    for alt in term.split(OR):
+        parts = []
+        for w in normalize(alt).split():
+            if all_forms and len(w) > MIN_STEM:
+                parts.append((stem(w), True))
+            else:
+                parts.append((w, False))
+        phrase = Phrase(tuple(parts))
+        if parts and phrase not in phrases:
+            phrases.append(phrase)
+    if not phrases:
+        raise ValueError("Ο όρος δεν έχει λέξεις.")
+    if len(phrases) > MAX_ALTERNATIVES:
+        raise ValueError(f"Έως {MAX_ALTERNATIVES} εναλλακτικοί όροι.")
+    return Query(term=" ".join(term.split()), phrases=tuple(phrases))
 
 
 class NewsIndex:
@@ -107,12 +146,24 @@ class NewsIndex:
 
     def _matches(self, cur, q: Query, field: str) -> tuple[str, dict] | None:
         """SQL που επιστρέφει τα aid των άρθρων με τον όρο, ή None αν σίγουρα δεν υπάρχει κανένα."""
-        pure = all(words(w) == [w] for w, _ in q.words)  # κάθε λέξη μόνο γράμματα
+        if len(q.phrases) == 1:
+            return self._phrase_matches(cur, q.phrases[0], field)
+        # OR: η ένωση των άρθρων κάθε εναλλακτικής φράσης.
+        aids: set[int] = set()
+        for phrase in q.phrases:
+            match = self._phrase_matches(cur, phrase, field)
+            if match is not None:
+                aids.update(r[0] for r in cur.execute(*match).fetchall())
+        return ("SELECT unnest($aids) AS aid", {"aids": sorted(aids)}) if aids else None
+
+    def _phrase_matches(self, cur, phrase: Phrase, field: str) -> tuple[str, dict] | None:
+        q = Query(term=phrase.label, phrases=(phrase,))
+        pure = all(words(w) == [w] for w, _ in phrase.words)  # κάθε λέξη μόνο γράμματα
         if pure:
-            tokens = list(q.words)
+            tokens = list(phrase.words)
         else:
             # Λέξη με ψηφία/σύμβολα: τα τμήματά της με γράμματα, ως προθέματα, δίνουν υπερσύνολο.
-            tokens = [(r, True) for w, _ in q.words for r in words(w)]
+            tokens = [(r, True) for w, _ in phrase.words for r in words(w)]
         if not tokens:  # ο όρος δεν έχει καθόλου γράμματα (π.χ. «2015»): έλεγχος σε όλα τα κείμενα
             return self._verify(cur, "SELECT aid FROM articles", q, field)
 
@@ -232,8 +283,9 @@ class ScanIndex:
     def _where(self, q: Query, field: str, categories: list[str] | None) -> tuple[str, dict]:
         col = FIELDS[field]
         # Το contains() είναι γρήγορο προφίλτρο· το regex ελέγχει την αρχή της λέξης.
-        sql = f"contains({col}, $anchor) AND regexp_matches({col}, $pattern)"
-        params = {"anchor": q.anchor, "pattern": q.pattern}
+        anchors = " OR ".join(f"contains({col}, $a{i})" for i in range(len(q.phrases)))
+        sql = f"({anchors}) AND regexp_matches({col}, $pattern)"
+        params = {f"a{i}": a for i, a in enumerate(q.anchors)} | {"pattern": q.pattern}
         if categories:
             sql += " AND list_contains($cats, category)"
             params["cats"] = categories

@@ -25,7 +25,7 @@ from typing import Callable
 
 from src.providers import SCRIPT_MODEL, KeyRejected, NoClient, Provider, SummaryUnavailable, parse_bullets
 from src.providers import Anthropic as AnthropicProvider
-from src.search import NewsIndex, Query
+from src.search import OR, NewsIndex, Query
 
 log = logging.getLogger("summarize")
 
@@ -38,7 +38,8 @@ MAX_CONCURRENT = 4
 MAX_TITLES = 80        # τίτλοι που στέλνονται ανά σύνοψη (όσοι έχουν τον όρο στον τίτλο πρώτοι)
 MAX_TITLE_CHARS = 200
 MAX_BULLETS = 4
-PROMPT_VERSION = "v2"  # αλλάζει όταν αλλάζει το prompt ή η μορφή της cache (v2: χωρίς το μοντέλο στο κλειδί)
+PROMPT_VERSION = "v3"  # αλλάζει όταν αλλάζει το prompt, η επιλογή τίτλων ή η μορφή της cache
+# (v2: χωρίς το μοντέλο στο κλειδί · v3: εναλλακτικοί όροι με «|», δείγμα τίτλων σε όλο τον μήνα)
 DB = Path(os.environ.get("SUMMARY_DB", Path(__file__).resolve().parents[1] / "data" / "summaries.sqlite"))
 
 MONTHS_GR = ["Ιανουάριος", "Φεβρουάριος", "Μάρτιος", "Απρίλιος", "Μάιος", "Ιούνιος",
@@ -63,6 +64,15 @@ SCHEMA = {
     "required": ["bullets"],
     "additionalProperties": False,
 }
+
+
+def spread(items: list, k: int) -> list:
+    """Έως k στοιχεία, σε ίσες αποστάσεις σε όλη τη λίστα (με τη σειρά της)."""
+    if k <= 0:
+        return []
+    if len(items) <= k:
+        return list(items)
+    return [items[(2 * i + 1) * len(items) // (2 * k)] for i in range(k)]
 
 
 class BudgetExceeded(Exception):
@@ -97,21 +107,25 @@ class Summarizer:
     # ---------------------------------------------------------------- δεδομένα
 
     def titles(self, q: Query, month: str, field: str, cats: list[str]) -> tuple[list[str], int]:
-        """(τίτλοι για το prompt, συνολικό πλήθος άρθρων του μήνα)."""
-        df = self.index.articles(q, month + "-01", field, cats)
-        seen, out = set(), []
-        for t in df["title"]:  # ήδη ταξινομημένα: πρώτα όσα έχουν τον όρο στον τίτλο
+        """(τίτλοι για το prompt, συνολικό πλήθος άρθρων του μήνα).
+
+        Πρώτα οι τίτλοι που περιέχουν τον όρο, μετά οι υπόλοιποι. Αν είναι περισσότεροι από MAX_TITLES, κάθε ομάδα
+        δειγματοληπτείται ομοιόμορφα σε όλο τον μήνα (όχι οι πρώτοι του μήνα), ώστε να μη χάνονται γεγονότα του
+        τέλους του μήνα. Το δείγμα είναι ντετερμινιστικό: ίδια άρθρα → ίδιοι τίτλοι → ίδιο κλειδί cache.
+        """
+        df = self.index.articles(q, month + "-01", field, cats)  # ταξινομημένα: in_title πρώτα, μετά χρονολογικά
+        seen, groups = set(), {True: [], False: []}
+        for t, in_title in zip(df["title"], df["in_title"]):
             t = " ".join(str(t).split())[:MAX_TITLE_CHARS]
             if t and t.lower() not in seen:
                 seen.add(t.lower())
-                out.append(t)
-            if len(out) == MAX_TITLES:
-                break
-        return out, len(df)
+                groups[bool(in_title)].append(t)
+        first = spread(groups[True], MAX_TITLES)
+        return first + spread(groups[False], MAX_TITLES - len(first)), len(df)
 
     @staticmethod
     def cache_key(q: Query, month: str, field: str, cats: list[str]) -> str:
-        raw = json.dumps({"v": PROMPT_VERSION, "words": q.words, "field": field,
+        raw = json.dumps({"v": PROMPT_VERSION, "words": q.key, "field": field,
                           "cats": sorted(cats), "month": month}, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -167,7 +181,8 @@ class Summarizer:
 
     def _call_llm(self, provider: Provider, term: str, month: str, titles: list[str]) -> list[str]:
         listing = "\n".join(f"- {t}" for t in titles)
-        user = (f"Όρος: «{term}»\nΜήνας: {month_label(month)}\nΤίτλοι άρθρων ({len(titles)}):\n"
+        term = " ή ".join(f"«{t.strip()}»" for t in term.split(OR) if t.strip())  # εναλλακτικοί όροι: «α» ή «β»
+        user = (f"Όρος: {term}\nΜήνας: {month_label(month)}\nΤίτλοι άρθρων ({len(titles)}):\n"
                 f"<titles>\n{listing}\n</titles>")
         bullets = parse_bullets(provider.complete(SYSTEM, user, SCHEMA))
         return [" ".join(str(b).split()).lstrip("•-– ") for b in bullets if str(b).strip()][:MAX_BULLETS]

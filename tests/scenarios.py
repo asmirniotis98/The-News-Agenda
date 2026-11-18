@@ -2,7 +2,7 @@
 
 Εκτέλεση από τον φάκελο του project, ένα σενάριο κάθε φορά (οι ρυθμίσεις διαβάζονται κατά την εκκίνηση):
     python tests/scenarios.py gate | misconfigured | short | summarizer claude-opus-5-5 | summarizer claude-haiku-5-5
-                              | llm_checkbox | byok
+                              | llm_checkbox | byok | providers | search_or
 """
 import json
 import os
@@ -410,3 +410,69 @@ elif scenario == "providers":
         ok(all(c["url"].startswith(("https://api.openai.com/", "anthropic:")) for c in calls), "every outgoing request went to a fixed provider")
     joined = "\n".join(logs)
     ok(OAI not in joined and ANT not in joined, f"no key in the logs ({len(logs)} lines)")
+
+elif scenario == "search_or":
+    # Εναλλακτικοί όροι με «|» και δείγμα τίτλων σε όλο τον μήνα (χωρίς πραγματικές κλήσεις στο LLM).
+    os.environ["SUMMARY_DB"] = os.path.join(tempfile.mkdtemp(), "s.sqlite")
+    from src.search import MAX_ALTERNATIVES, NewsIndex, make_query
+    from src import summarize as S
+
+    q = make_query("κορωνοϊός | Κορονοϊός |  | κορωνοϊός")
+    ok(len(q.phrases) == 2 and q.label == "κορωνοι… | κορονοι…", f"two alternatives, empty and repeated ones dropped ({q.label})")
+    ok(make_query("α | β").key == make_query("β | α").key, "cache key does not depend on the order of the alternatives")
+    ok(make_query("μνημόνιο").key != make_query("μνημόνιο | ΔΝΤ").key, "adding an alternative changes the cache key")
+    for bad in ("|", " | | ", " | ".join(["α", "β", "γ", "δ", "ε", "ζ"])):
+        try:
+            make_query(bad); ok(False, f"rejected: {bad!r}")
+        except ValueError:
+            ok(True, f"rejected: {bad!r}")
+
+    idx = NewsIndex()
+    def hits(t, field="text"):
+        return int(idx.monthly(make_query(t), field)["hits"].sum())
+    def aids(t):
+        cur = idx.con.cursor()
+        m = idx._matches(cur, make_query(t), "text")
+        return set() if m is None else {r[0] for r in cur.execute(*m).fetchall()}
+    a, b = aids("κορωνοϊός"), aids("κορονοϊός")
+    ok(aids("κορωνοϊός | κορονοϊός") == a | b and len(a & b) > 0, f"OR = union of the two searches ({len(a | b)} articles, {len(a & b)} with both)")
+    ok(hits("μνημόνιο | ΔΝΤ") == len(aids("μνημόνιο") | aids("ΔΝΤ")), "monthly counts match the union")
+    ok(hits("μνημόνιο | ξξξξξξξ") == hits("μνημόνιο"), "an alternative with no matches changes nothing")
+    ok(hits("ξξξξξξξ | ψψψψψψψ") == 0, "no alternative matches -> 0")
+    ok(aids("ενεργειακή κρίση | covid-19") == aids("ενεργειακή κρίση") | aids("covid-19"), "phrases and terms with digits work as alternatives")
+    df = idx.articles(make_query("κορωνοϊός | κορονοϊός"), "2020-03-01")
+    ok(df["in_title"].any() and df["in_title"].is_monotonic_decreasing, "articles: titles with any alternative first")
+
+    # Δείγμα τίτλων: ομοιόμορφο σε όλο τον μήνα, ντετερμινιστικό.
+    ok(S.spread(list(range(10)), 5) == [1, 3, 5, 7, 9] and S.spread([1, 2], 5) == [1, 2] and S.spread([1], 0) == [],
+       "spread(): evenly spaced, whole list when short")
+    calls = []
+    fake = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: calls.append(kw) or SimpleNamespace(
+        stop_reason="end_turn", model=kw["model"], usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        content=[SimpleNamespace(type="text", text=json.dumps({"bullets": ["Δοκιμή"]}))]))))
+    s = S.Summarizer(idx, client=fake)
+    q = make_query("κορωνοϊός | κορονοϊός")
+    titles, n = s.titles(q, "2020-03", "text", [])
+    ok(len(titles) == S.MAX_TITLES and n > 1000, f"month with {n} articles -> {len(titles)} titles")
+    ok(titles == s.titles(q, "2020-03", "text", [])[0], "same articles -> same titles (deterministic)")
+    sel = df[df["title"].map(lambda t: " ".join(str(t).split())[:S.MAX_TITLE_CHARS]).isin(titles)]
+    group = df[df["in_title"]]["created"]  # 674 τίτλοι με τον όρο· ουσιαστικά από τις 11/3
+    first80 = group.iloc[S.MAX_TITLES - 1].day  # η παλιά επιλογή (οι πρώτοι 80) σταματούσε εδώ
+    days = sel["created"].dt.day
+    ok(days.min() <= group.iloc[10].day and days.max() >= group.iloc[-10].day and days.max() > first80,
+       f"titles span the whole month (days {days.min()}–{days.max()}; the first {S.MAX_TITLES} would stop on day {first80})")
+    s.summary(q, "2020-03", "text", [])
+    ok("Όρος: «κορωνοϊός» ή «κορονοϊός»" in calls[0]["messages"][0]["content"], "prompt names the alternatives as «α» ή «β»")
+    ok(s.summary(make_query("κορονοϊός|κορωνοϊός"), "2020-03", "text", [])["cached"] and len(calls) == 1,
+       "same alternatives in another order -> cached summary")
+
+    from fastapi.testclient import TestClient
+    import server
+    with TestClient(server.app) as c:
+        r = c.get("/api/search", params={"q": "κορωνοϊός | κορονοϊός"}).json()
+        ok(r["label"] == "κορωνοι… | κορονοι…" and r["total_hits"] == len(a | b), "API: search with alternatives")
+        ok(c.get("/api/search", params={"q": " | ".join("αβγδεζ")}).status_code == 422, f"API: more than {MAX_ALTERNATIVES} alternatives -> 422")
+        ok(c.get("/api/search", params={"q": "|"}).status_code == 422, "API: no words -> 422")
+        ok(c.get("/api/search", params={"q": "α" * 101}).status_code == 422, "API: longer than 100 characters -> 422")
+        ok(c.get("/api/articles", params={"q": "κορωνοϊός | κορονοϊός", "month": "2020-03"}).json()["total"] == len(df),
+           "API: articles with alternatives")
